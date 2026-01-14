@@ -248,7 +248,7 @@ def show_schedule_popup(target_teacher, full_df, initiator_name, source_details,
 # ==========================================
 
 def main():
-    st.title("🏫 成德高中 智慧調代課系統 v6.5")
+    st.title("🏫 成德高中 簡易調代課系統 v6.5")
     
     if 'table_reset_key' not in st.session_state:
         st.session_state.table_reset_key = 0
@@ -428,4 +428,5 @@ def main():
                     st.warning("無符合條件的互換人選。")
 
 if __name__ == "__main__":
+
     main()
