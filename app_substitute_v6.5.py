@@ -7,7 +7,7 @@ import json
 from datetime import date, timedelta
 
 # 設定頁面資訊
-st.set_page_config(page_title="成德高中 智慧調代課系統 v6.5", layout="wide")
+st.set_page_config(page_title="成德高中 簡易調代課系統 v6.5", layout="wide")
 
 # ==========================================
 # 1. 資料清洗與輔助函式
@@ -430,3 +430,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
