@@ -6,7 +6,7 @@ import streamlit.components.v1 as components
 # ==========================================
 # 0. 系統設定
 # ==========================================
-st.set_page_config(page_title="成德高中 智慧調代課系統 v28", layout="wide")
+st.set_page_config(page_title="成德高中 智慧調代課系統 v29", layout="wide")
 
 # ==========================================
 # 1. 核心邏輯：欣河系統解析
@@ -19,7 +19,7 @@ def parse_xinhe_csv(uploaded_file):
         uploaded_file.seek(0)
         df = pd.read_csv(uploaded_file, encoding='cp950', header=None, on_bad_lines='skip')
     
-    # 第一次清洗：填補空值並轉字串
+    # 第一次清洗
     df = df.fillna("").astype(str)
     
     all_data = []
@@ -103,17 +103,14 @@ def parse_xinhe_csv(uploaded_file):
     full_df = pd.DataFrame(index=full_idx).reset_index()
     final_df = pd.merge(full_df, data_df, on=['teacher', 'day', 'period'], how='left')
     
-    # 補空值
     final_df['content'] = final_df['content'].fillna("")
     final_df['subject'] = final_df['subject'].fillna("")
     final_df['class_name'] = final_df['class_name'].fillna("")
     final_df['is_free'] = final_df['content'] == ""
     
     def split_content(row):
-        # 如果已經有拆好的欄位就用，沒有就嘗試從 content 拆
         s, c = row['subject'], row['class_name']
         if s or c: return str(s), str(c)
-        
         match = re.search(r"^(.*)\s+\((.*)\)$", str(row['content']))
         if match: return match.group(1), match.group(2)
         return str(row['content']), ""
@@ -122,27 +119,36 @@ def parse_xinhe_csv(uploaded_file):
     final_df['subject'] = [x[0] for x in res]
     final_df['class_name'] = [x[1] for x in res]
     
-    # 【關鍵修正】最後再做一次強制轉型，確保所有資料都是字串，防止 TypeError
     return final_df.astype(str)
 
 # ==========================================
-# 2. 領域判定邏輯 (已修正)
+# 2. 領域判定邏輯 (v29 更新版)
 # ==========================================
 def determine_domain(teacher_name, df):
     """
-    根據該教師的所有課程名稱，判斷其所屬領域 (科別)
+    優先檢查手動名單，若無則根據課程關鍵字自動判定
     """
-    # 取得該教師所有非空的科目
-    subjects = df[(df['teacher'] == teacher_name) & (df['subject'] != "")]['subject'].unique()
     
-    # 【關鍵修正】這裡加入 [str(s) for s in subjects]，確保即使混入 float 也不會報錯
+    # 【重點修正】手動強制指定名單 (Manual Override)
+    # 如果系統分錯，直接把名字加在這裡，優先級最高
+    manual_fix = {
+        "王安順": "自然",
+        "黃琮琪": "自然",
+        # "陳小明": "數學",  <-- 未來若有錯，這樣加即可
+    }
+    
+    if teacher_name in manual_fix:
+        return manual_fix[teacher_name]
+
+    # --- 以下為自動判斷邏輯 ---
+    subjects = df[(df['teacher'] == teacher_name) & (df['subject'] != "")]['subject'].unique()
     all_subjects_str = "".join([str(s) for s in subjects])
     
     domain_map = {
         "國文": ["國文", "國語", "閱讀", "寫作", "語文"],
         "英文": ["英文", "英語", "English", "聽講"],
         "數學": ["數學", "數A", "數B", "幾何", "微積分", "補強"],
-        "自然": ["物理", "化學", "生物", "地科", "科學", "探究", "實驗"],
+        "自然": ["物理", "化學", "生物", "地科", "科學", "探究", "實驗", "理化"], # 已加入理化
         "社會": ["歷史", "地理", "公民", "社會", "經濟", "心理"],
         "健體": ["體育", "健康", "護理", "運動"],
         "藝能": ["美術", "音樂", "藝術", "表演", "繪畫"],
@@ -172,7 +178,6 @@ def determine_domain(teacher_name, df):
 def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
     st.subheader(f"🤝 與 {teacher_b} 老師的互換詳情")
     
-    # B 課表
     st.markdown(f"**{teacher_b} 老師的課表：**")
     b_df = full_df[full_df['teacher'] == teacher_b]
     pivot = b_df.pivot(index='period', columns='day', values='content')
@@ -187,7 +192,6 @@ def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
 
     st.divider()
 
-    # 內容解析
     src_day = re.search(r"週(.)", source_info).group(1)
     src_per = re.search(r"第(\d)", source_info).group(1)
     src_content = source_info.split("|")[1].strip()
@@ -255,9 +259,8 @@ def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
 # 3. 主程式 UI
 # ==========================================
 def main():
-    st.title("🏫 成德高中 智慧調代課系統 v28")
+    st.title("🏫 成德高中 智慧調代課系統 v29")
     
-    # 初始化 Session State
     if 'data_loaded' not in st.session_state: st.session_state.data_loaded = False
     if 'swap_results' not in st.session_state: st.session_state.swap_results = None
     
@@ -289,7 +292,6 @@ def main():
             if "未知" in all_domains: all_domains.remove("未知")
             all_domains = ["全部"] + all_domains
 
-            # 確保班級是字串，防止排序報錯
             unique_classes = df['class_name'].unique()
             clean_classes = [str(c) for c in unique_classes if pd.notna(c) and str(c).strip() != ""]
             all_classes = sorted(clean_classes)
@@ -314,11 +316,8 @@ def main():
                 c1, c2 = st.columns(2)
                 q_day = c1.selectbox("缺課星期", ["一","二","三","四","五"])
                 q_per = c2.selectbox("缺課節次", [str(i) for i in range(1,9)])
-                # 這裡也要確保 is_free 是 boolean，但從 parse 已經轉了 str，需注意 'True'/'False' 字串
-                # 因為 parse_xinhe_csv 最後做了一次 astype(str)，所以 True 變成了 "True"
-                # 我們需要轉換判斷邏輯
                 
-                # 修正篩選邏輯：因為 df 全轉 str 了
+                # is_free 是字串 "True"/"False"
                 frees = df[(df['day']==q_day) & (df['period']==q_per) & (df['is_free'] == "True")]
                 
                 if not frees.empty:
@@ -332,7 +331,6 @@ def main():
             with tab3:
                 st.markdown("### 🔄 課程互換計算機")
                 
-                # 科別篩選
                 col_sub, col_tea = st.columns([1, 2])
                 with col_sub:
                     filter_domain = st.selectbox("1. 篩選領域 (科別)", all_domains)
@@ -357,7 +355,6 @@ def main():
                     col_a, col_b = st.columns(2)
                     with col_a:
                         st.info("步驟 1：選擇您要調出的課")
-                        # 修正判斷邏輯: is_free == "False"
                         a_busy = df[(df['teacher']==who_a) & (df['is_free'] == "False")]
                         src_opts = []
                         a_src_class_map = {} 
@@ -372,7 +369,6 @@ def main():
 
                     with col_b:
                         st.info("步驟 2：選擇您想換過去的時間")
-                        # 修正判斷邏輯: is_free == "True"
                         a_free = df[(df['teacher']==who_a) & (df['is_free'] == "True") & (df['period'] != '8')]
                         tgt_opts = [f"週{r['day']} 第{r['period']}節" for _, r in a_free.iterrows()]
                         sel_tgt = st.selectbox("我的調入時間 (空堂)", tgt_opts)
@@ -399,7 +395,6 @@ def main():
                         my_src_class = a_src_class_map.get(sel_src, "")
 
                         if st.button("🔍 搜尋可互換對象"):
-                            # 修正: is_free == "True"
                             cands = df[(df['day']==s_day) & (df['period']==s_per) & (df['is_free'] == "True") & (df['teacher']!=who_a)]
                             if filter_teacher != "不指定":
                                 cands = cands[cands['teacher'] == filter_teacher]
@@ -409,7 +404,6 @@ def main():
                             results = []
                             for b in cand_teachers:
                                 b_crs = df[(df['teacher']==b) & (df['day']==t_day) & (df['period']==t_per)]
-                                # 修正: is_free == "False" (非空堂才能換)
                                 if not b_crs.empty and b_crs.iloc[0]['is_free'] == "False":
                                     row_data = b_crs.iloc[0]
                                     b_class = row_data['class_name']
