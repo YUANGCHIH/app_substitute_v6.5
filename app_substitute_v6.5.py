@@ -6,7 +6,7 @@ import streamlit.components.v1 as components
 # ==========================================
 # 0. 系統設定
 # ==========================================
-st.set_page_config(page_title="成德高中 智慧調代課系統 v29", layout="wide")
+st.set_page_config(page_title="成德高中 智慧調代課系統 v30", layout="wide")
 
 # ==========================================
 # 1. 核心邏輯：欣河系統解析
@@ -19,7 +19,7 @@ def parse_xinhe_csv(uploaded_file):
         uploaded_file.seek(0)
         df = pd.read_csv(uploaded_file, encoding='cp950', header=None, on_bad_lines='skip')
     
-    # 第一次清洗
+    # 清洗資料
     df = df.fillna("").astype(str)
     
     all_data = []
@@ -122,25 +122,18 @@ def parse_xinhe_csv(uploaded_file):
     return final_df.astype(str)
 
 # ==========================================
-# 2. 領域判定邏輯 (v29 更新版)
+# 2. 領域判定邏輯
 # ==========================================
 def determine_domain(teacher_name, df):
-    """
-    優先檢查手動名單，若無則根據課程關鍵字自動判定
-    """
-    
-    # 【重點修正】手動強制指定名單 (Manual Override)
-    # 如果系統分錯，直接把名字加在這裡，優先級最高
+    # 手動修正名單
     manual_fix = {
         "王安順": "自然",
         "黃琮琪": "自然",
-        # "陳小明": "數學",  <-- 未來若有錯，這樣加即可
     }
     
     if teacher_name in manual_fix:
         return manual_fix[teacher_name]
 
-    # --- 以下為自動判斷邏輯 ---
     subjects = df[(df['teacher'] == teacher_name) & (df['subject'] != "")]['subject'].unique()
     all_subjects_str = "".join([str(s) for s in subjects])
     
@@ -148,7 +141,7 @@ def determine_domain(teacher_name, df):
         "國文": ["國文", "國語", "閱讀", "寫作", "語文"],
         "英文": ["英文", "英語", "English", "聽講"],
         "數學": ["數學", "數A", "數B", "幾何", "微積分", "補強"],
-        "自然": ["物理", "化學", "生物", "地科", "科學", "探究", "實驗", "理化"], # 已加入理化
+        "自然": ["物理", "化學", "生物", "地科", "科學", "探究", "實驗", "理化"],
         "社會": ["歷史", "地理", "公民", "社會", "經濟", "心理"],
         "健體": ["體育", "健康", "護理", "運動"],
         "藝能": ["美術", "音樂", "藝術", "表演", "繪畫"],
@@ -259,7 +252,7 @@ def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
 # 3. 主程式 UI
 # ==========================================
 def main():
-    st.title("🏫 成德高中 智慧調代課系統 v29")
+    st.title("🏫 成德高中 智慧調代課系統 v30")
     
     if 'data_loaded' not in st.session_state: st.session_state.data_loaded = False
     if 'swap_results' not in st.session_state: st.session_state.swap_results = None
@@ -301,9 +294,18 @@ def main():
             # --- Tabs ---
             tab1, tab2, tab3 = st.tabs(["📅 課表檢視", "🚑 尋找空堂", "🔄 互換調課"])
 
-            # Tab 1
+            # Tab 1: 課表檢視 (更新：加入科別篩選)
             with tab1:
-                t_sel_display = st.selectbox("選擇教師", sorted(teacher_display_map.values()), key="t1")
+                col_d, col_t = st.columns([1, 2])
+                with col_d:
+                    t1_domain = st.selectbox("篩選領域", all_domains, key="t1_dom")
+                with col_t:
+                    if t1_domain == "全部":
+                        t1_opts = sorted(teacher_display_map.values())
+                    else:
+                        t1_opts = sorted([v for k, v in teacher_display_map.items() if teacher_domain_map[k] == t1_domain])
+                    t_sel_display = st.selectbox("選擇教師", t1_opts, key="t1_who")
+
                 if t_sel_display:
                     t_real = [k for k, v in teacher_display_map.items() if v == t_sel_display][0]
                     t_df = df[df['teacher'] == t_real]
@@ -311,29 +313,71 @@ def main():
                     pivot = pivot.reindex([str(i) for i in range(1,9)]).reindex(columns=["一","二","三","四","五"]).fillna("")
                     st.dataframe(pivot, use_container_width=True)
 
-            # Tab 2
+            # Tab 2: 尋找空堂 (更新：加入科別/姓名篩選器)
             with tab2:
+                st.subheader("1. 設定缺課時段")
                 c1, c2 = st.columns(2)
                 q_day = c1.selectbox("缺課星期", ["一","二","三","四","五"])
                 q_per = c2.selectbox("缺課節次", [str(i) for i in range(1,9)])
                 
-                # is_free 是字串 "True"/"False"
+                # 先找出所有空堂老師
                 frees = df[(df['day']==q_day) & (df['period']==q_per) & (df['is_free'] == "True")]
                 
-                if not frees.empty:
-                    st.success(f"找到 {len(frees)} 位空堂教師：")
-                    frees['display_name'] = frees['teacher'].map(teacher_display_map)
-                    st.dataframe(frees[['display_name']].reset_index(drop=True), use_container_width=True)
-                else:
-                    st.warning("無空堂教師。")
+                st.divider()
+                st.subheader("2. 篩選空堂名單")
+                
+                # 加入篩選器
+                c3, c4 = st.columns([1, 2])
+                with c3:
+                    t2_domain = st.selectbox("篩選領域 (科別)", all_domains, key="t2_dom")
+                with c4:
+                    # 根據「空堂名單」和「科別」動態產生姓名選單
+                    # 先過濾領域
+                    if t2_domain == "全部":
+                        # 只顯示「目前有空」的老師
+                        available_teachers = sorted(frees['teacher'].unique())
+                    else:
+                        available_teachers = sorted([t for t in frees['teacher'].unique() if teacher_domain_map[t] == t2_domain])
+                    
+                    # 轉成顯示名稱
+                    available_display = [teacher_display_map[t] for t in available_teachers]
+                    
+                    # 姓名選單 (增加「全部」選項)
+                    t2_name_filter = st.selectbox("篩選特定教師 (可選)", ["全部顯示"] + available_display, key="t2_who")
 
-            # Tab 3
+                # 應用篩選結果
+                if not frees.empty:
+                    final_frees = frees.copy()
+                    
+                    # 1. 領域過濾
+                    if t2_domain != "全部":
+                        # 找出該領域的老師名單
+                        domain_teachers = [k for k, v in teacher_domain_map.items() if v == t2_domain]
+                        final_frees = final_frees[final_frees['teacher'].isin(domain_teachers)]
+                    
+                    # 2. 姓名過濾
+                    if t2_name_filter != "全部顯示":
+                        # 反查真實姓名
+                        target_real = [k for k, v in teacher_display_map.items() if v == t2_name_filter][0]
+                        final_frees = final_frees[final_frees['teacher'] == target_real]
+
+                    # 顯示結果
+                    if not final_frees.empty:
+                        st.success(f"符合條件的空堂教師共 {len(final_frees)} 位：")
+                        final_frees['display_name'] = final_frees['teacher'].map(teacher_display_map)
+                        st.dataframe(final_frees[['display_name']].reset_index(drop=True), use_container_width=True)
+                    else:
+                        st.warning("在此篩選條件下，無空堂教師。")
+                else:
+                    st.warning("該時段全校皆有課，無空堂教師。")
+
+            # Tab 3: 互換調課 (維持 v29 的完美狀態)
             with tab3:
                 st.markdown("### 🔄 課程互換計算機")
                 
                 col_sub, col_tea = st.columns([1, 2])
                 with col_sub:
-                    filter_domain = st.selectbox("1. 篩選領域 (科別)", all_domains)
+                    filter_domain = st.selectbox("1. 篩選領域 (科別)", all_domains, key="t3_dom")
                 
                 with col_tea:
                     if filter_domain == "全部":
@@ -341,7 +385,7 @@ def main():
                     else:
                         filtered_teachers = sorted([v for k, v in teacher_display_map.items() if teacher_domain_map[k] == filter_domain])
                     
-                    who_a_display = st.selectbox("2. 我是 (A老師)", filtered_teachers, key="t3")
+                    who_a_display = st.selectbox("2. 我是 (A老師)", filtered_teachers, key="t3_who")
                 
                 if who_a_display:
                     who_a = [k for k, v in teacher_display_map.items() if v == who_a_display][0]
