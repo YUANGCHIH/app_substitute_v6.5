@@ -4,11 +4,12 @@ import re
 import datetime
 import time
 import streamlit.components.v1 as components
+from collections import defaultdict
 
 # ==========================================
 # 0. 系統設定
 # ==========================================
-st.set_page_config(page_title="成德高中 智慧調代課系統 v36", layout="wide")
+st.set_page_config(page_title="成德高中 智慧調代課系統 v40", layout="wide")
 
 # ==========================================
 # 1. 核心邏輯：欣河系統解析
@@ -122,12 +123,26 @@ def parse_xinhe_csv(uploaded_file):
     return final_df.astype(str)
 
 # ==========================================
-# 2. 輔助功能
+# 2. 輔助與規則判定
 # ==========================================
-def is_locked_time(day, period):
-    """判斷是否為鎖定時段 (週三 5, 6, 7)"""
+def is_locked_time(day, period, subject="", class_name=""):
+    # 1. 全校鎖定
     if day == "三" and str(period) in ["5", "6", "7"]:
         return True
+    
+    # 2. 閩南語不可調
+    if "閩南語" in subject:
+        return True
+    
+    # 3. 高一1~高一8 週四第7節不可調
+    if day == "四" and str(period) == "7":
+        if class_name and "高一" in class_name:
+            suffix = class_name.replace("高一", "").strip()
+            if suffix.isdigit():
+                num = int(suffix)
+                if 1 <= num <= 8:
+                    return True
+
     return False
 
 def determine_domain(teacher_name, df):
@@ -168,6 +183,7 @@ def determine_domain(teacher_name, df):
 # ==========================================
 # 3. 彈出視窗與通知單
 # ==========================================
+
 @st.dialog("課程互換與通知單", width="large")
 def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
     st.subheader(f"🤝 與 {teacher_b} 老師的互換詳情")
@@ -270,23 +286,81 @@ def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
         if st.button("關閉視窗", use_container_width=True):
             st.rerun()
 
-# 失敗提示窗
+@st.dialog("多角調課詳細路徑圖", width="large")
+def show_multi_path_visual(path_list, full_df):
+    st.subheader("👁️ 循環調課視覺化")
+    st.info("橘色底標示為「本次調動涉及的時段」。")
+
+    teachers_in_order = []
+    if not path_list: return
+    
+    teachers_in_order.append(path_list[0]['from'])
+    for step in path_list:
+        teachers_in_order.append(step['to'])
+    
+    unique_teachers = []
+    seen = set()
+    for t in teachers_in_order:
+        if t not in seen:
+            unique_teachers.append(t)
+            seen.add(t)
+
+    highlight_map = {} 
+
+    for step in path_list:
+        giver = step['from']
+        receiver = step['to']
+        d = step['day']
+        p = step['period']
+        
+        if giver not in highlight_map: highlight_map[giver] = []
+        highlight_map[giver].append((d, p))
+        
+        if receiver not in highlight_map: highlight_map[receiver] = []
+        highlight_map[receiver].append((d, p))
+
+    for tea in unique_teachers:
+        st.markdown(f"#### 👤 {tea}")
+        t_df = full_df[full_df['teacher'] == tea]
+        pivot = t_df.pivot(index='period', columns='day', values='content')
+        pivot = pivot.reindex([str(i) for i in range(1,9)]).reindex(columns=["一","二","三","四","五"]).fillna("")
+
+        points_to_color = highlight_map.get(tea, [])
+        
+        def highlight_target(val, r, c, points):
+            if (c, r) in points:
+                return 'background-color: #ffcc99; color: black; font-weight: bold; border: 2px solid orange;'
+            return ''
+
+        st.dataframe(
+            pivot.style.apply(lambda x: pd.DataFrame([[highlight_target(x.iloc[i,j], pivot.index[i], pivot.columns[j], points_to_color) for j in range(5)] for i in range(8)], index=pivot.index, columns=pivot.columns), axis=None), 
+            use_container_width=True,
+            height=300 
+        )
+        st.write("⬇️")
+    
+    st.write("(循環完成)")
+    if st.button("關閉", use_container_width=True):
+        st.rerun()
+
 @st.dialog("搜尋結果", width="small")
 def show_no_result_dialog():
     st.error("❌ 無適合配對結果")
-    st.write("在限制「4人以內」且「必須為任課教師」的條件下，找不到可行的循環路徑。")
-    st.write("建議：嘗試放寬條件，或選擇其他調出課程。")
+    st.write("原因可能為：")
+    st.write("1. 找不到其他老師在「相同班級」的課程來進行互補。")
+    st.write("2. 目標老師雖然有空，但教授的是不同班級 (避免造成空堂)。")
     if st.button("知道了", use_container_width=True):
         st.rerun()
 
 # ==========================================
-# 3. 主程式 UI
+# 4. 主程式 UI
 # ==========================================
 def main():
-    st.title("🏫 成德高中 智慧調代課系統 v36")
+    st.title("🏫 成德高中 智慧調代課系統 v40")
     
     if 'data_loaded' not in st.session_state: st.session_state.data_loaded = False
     if 'swap_results' not in st.session_state: st.session_state.swap_results = None
+    if 'multi_swap_paths' not in st.session_state: st.session_state.multi_swap_paths = None
     
     with st.sidebar:
         st.header("步驟 1：匯入資料")
@@ -314,7 +388,6 @@ def main():
             clean_classes = sorted([str(c) for c in unique_classes if pd.notna(c) and str(c).strip() != ""])
             all_teachers_real = sorted(df['teacher'].unique())
 
-            # --- V35 New Map: Class -> Teachers Set ---
             class_teacher_map = {}
             for cls in clean_classes:
                 if cls:
@@ -334,27 +407,24 @@ def main():
                         free_map[(d,p)] = t_free
 
             # ==========================================
-            # v36: 使用 Radio 當作導覽列，處理離開頁面重置邏輯
+            # 導覽列
             # ==========================================
             nav_options = ["1. 📅 課表檢視", "2. 🚑 尋找空堂", "3. 🔄 雙人互換", "4. 🔀 多角調(測試)"]
             selected_nav = st.radio("功能選擇", nav_options, horizontal=True)
 
-            # 檢測是否切換頁面
             if 'last_nav' not in st.session_state:
                 st.session_state.last_nav = selected_nav
             
             if st.session_state.last_nav != selected_nav:
-                # 頁面已變更，執行清理
-                # 如果是離開「3. 雙人互換」，清除相關 Session State
                 if "3." in st.session_state.last_nav:
-                    # 強制清除雙人互換的選擇狀態
                     keys_to_clear = ["t3_dom", "t3_who", "swap_table"]
                     for k in keys_to_clear:
-                        if k in st.session_state:
-                            del st.session_state[k]
+                        if k in st.session_state: del st.session_state[k]
                     st.session_state.swap_results = None
                 
-                # 更新狀態並重新執行以反映變更
+                if "4." in st.session_state.last_nav:
+                    st.session_state.multi_swap_paths = None 
+                
                 st.session_state.last_nav = selected_nav
                 st.rerun()
 
@@ -415,7 +485,6 @@ def main():
             elif "3." in selected_nav:
                 st.subheader("🔄 雙人直接調課")
                 col_sub, col_tea = st.columns([1, 2])
-                # 注意：這裡的 key 是 t3_dom, t3_who，當頁面切換時，我們在上方邏輯已清除這些 key
                 with col_sub: filter_domain = st.selectbox("1. 篩選領域 (科別)", all_domains, key="t3_dom")
                 with col_tea:
                     filtered_teachers = sorted(teacher_display_map.values()) if filter_domain == "全部" else sorted([v for k, v in teacher_display_map.items() if teacher_domain_map[k] == filter_domain])
@@ -439,7 +508,7 @@ def main():
                         my_teaching_classes = set()
                         if not a_busy.empty:
                             for _, r in a_busy.iterrows():
-                                if is_locked_time(r['day'], r['period']): continue
+                                if is_locked_time(r['day'], r['period'], r['subject'], r['class_name']): continue
                                 opt_str = f"週{r['day']} 第{r['period']}節 | {r['content']}"
                                 src_opts.append(opt_str)
                                 a_src_class_map[opt_str] = r['class_name']
@@ -489,7 +558,7 @@ def main():
                                     b_crs = df[(df['teacher']==b) & (df['is_free'] == "False")]
                                 
                                 for _, row_data in b_crs.iterrows():
-                                    if is_locked_time(row_data['day'], row_data['period']): continue
+                                    if is_locked_time(row_data['day'], row_data['period'], row_data['subject'], row_data['class_name']): continue
 
                                     if not t_day:
                                         a_check = a_free[(a_free['day'] == row_data['day']) & (a_free['period'] == row_data['period'])]
@@ -545,7 +614,7 @@ def main():
             # Page 4: 多角調
             elif "4." in selected_nav:
                 st.subheader("🔀 多角循環調課 (Beta)")
-                st.info("限制條件：\n1. 參與調課的老師，必須是該課程班級的任課老師。\n2. **最多支援 4 人**互調 (A→B→C→D→A)。")
+                st.info("限制條件：\n1. 必須鎖定在「同一班級」內調動，避免產生空堂。\n2. 最多 4 人互調。\n3. 閩南語及高一週四第7節不可調動。")
 
                 col_sub4, col_tea4 = st.columns([1, 2])
                 with col_sub4: filter_domain4 = st.selectbox("1. 篩選領域", all_domains, key="t4_dom")
@@ -565,7 +634,7 @@ def main():
                         src_opts4 = []
                         if not a_busy4.empty:
                             for _, r in a_busy4.iterrows():
-                                if is_locked_time(r['day'], r['period']): continue
+                                if is_locked_time(r['day'], r['period'], r['subject'], r['class_name']): continue
                                 opt_str = f"週{r['day']} 第{r['period']}節 | {r['content']}"
                                 src_opts4.append(opt_str)
                                 a_src_class_map_4[opt_str] = r['class_name']
@@ -582,7 +651,8 @@ def main():
 
                     if sel_src4 and sel_tgt4:
                         if st.button("🚀 開始深度搜尋 (Max 60s)"):
-                            # v36: Status Indicator
+                            st.session_state.multi_swap_paths = None
+                            
                             with st.status("🔍 全速運算中，請稍候...", expanded=True) as status:
                                 st.write("正在分析空堂與任課班級關係...")
                                 
@@ -591,13 +661,16 @@ def main():
                                 s_per = re.search(r"第(\d)", sel_src4).group(1)
                                 start_class_name = a_src_class_map_4.get(sel_src4, "")
                                 
+                                # 強制鎖定班級：所有交換必須在此班級內發生
+                                target_class_lock = start_class_name 
+                                
                                 target_d, target_p = None, None
                                 if sel_tgt4 != "不指定":
                                     target_d = re.search(r"週(.)", sel_tgt4).group(1)
                                     target_p = re.search(r"第(\d)", sel_tgt4).group(1)
 
                                 found_paths = []
-                                max_depth = 4 # v36: 限制最多 4 人 (Edge count = 4)
+                                max_depth = 4 
                                 
                                 if target_d:
                                     a_valid_targets = {(target_d, target_p)}
@@ -608,10 +681,7 @@ def main():
 
                                 def dfs_find_loop(current_teacher, offering_day, offering_period, offering_class, path, visited):
                                     if time.time() - start_time > 60: return "TIMEOUT"
-                                    
-                                    # v36: Strict Max Depth (4 people = path length 3 before closing, or 4 total edges)
-                                    if len(path) >= max_depth:
-                                        return
+                                    if len(path) >= max_depth: return
 
                                     candidates = free_map.get((offering_day, offering_period), set())
                                     teachers_of_class = class_teacher_map.get(offering_class, set())
@@ -628,13 +698,17 @@ def main():
                                         for _, row_b in next_busy_slots.iterrows():
                                             b_out_day = row_b['day']
                                             b_out_per = row_b['period']
-                                            if is_locked_time(b_out_day, b_out_per): continue
                                             
+                                            if is_locked_time(b_out_day, b_out_per, row_b['subject'], row_b['class_name']): continue
+                                            
+                                            # V40 重大修正：嚴格檢查釋出的課程是否為同一班級
+                                            if row_b['class_name'] != target_class_lock: continue
+
                                             if (b_out_day, b_out_per) in a_valid_targets:
                                                 class_returned = row_b['class_name']
-                                                teachers_of_returned = class_teacher_map.get(class_returned, set())
                                                 
-                                                if class_returned and who_a4 not in teachers_of_returned: continue
+                                                # 再次確認收到的班級 (理論上上面已經 filter，但雙重保險)
+                                                if class_returned != target_class_lock: continue
 
                                                 final_step = {
                                                     'from': next_person,
@@ -656,7 +730,6 @@ def main():
                                                 if len(found_paths) >= 50: return
 
                                             else:
-                                                # v36: Optimization - Only continue if we haven't reached depth limit
                                                 if len(path) < max_depth - 1:
                                                     new_step = {
                                                         'from': current_teacher,
@@ -679,35 +752,54 @@ def main():
                                 status_code = dfs_find_loop(who_a4, s_day, s_per, start_class_name, [], {who_a4})
                                 
                                 st.write("整理搜尋結果...")
-                                time.sleep(0.5) # UX Delay to show completion
+                                time.sleep(0.5) 
                                 status.update(label="✅ 搜尋完成", state="complete", expanded=False)
 
                             if status_code == "TIMEOUT":
                                 st.error("⚠️ 搜尋超時 (超過 60 秒)，顯示已找到的結果...")
                             
                             if found_paths:
-                                st.success(f"找到 {len(found_paths)} 條符合「任課班級」限制的路徑！")
-                                display_data = []
-                                for idx, p_list in enumerate(found_paths):
-                                    chain_str = ""
-                                    persons = [who_a4] + [step['to'] for step in p_list]
-                                    chain_str = " ➔ ".join(persons)
-                                    
-                                    first_content = sel_src4.split('|')[1].strip()
-                                    row_dict = {"路徑": chain_str}
-                                    row_dict[f"1. {who_a4} 給出"] = f"週{p_list[0]['day']}{p_list[0]['period']} ({first_content})"
-                                    
-                                    for i in range(1, len(p_list)):
-                                        step = p_list[i]
-                                        prev_person = p_list[i-1]['to']
-                                        row_dict[f"{i+1}. {prev_person} 給出"] = f"週{step['day']}{step['period']} ({step['content']})"
-                                    
-                                    display_data.append(row_dict)
-
-                                st.dataframe(pd.DataFrame(display_data), use_container_width=True)
+                                st.session_state.multi_swap_paths = found_paths
                             else:
-                                # v36: Pop-up dialog if no result
                                 show_no_result_dialog()
+
+                        if st.session_state.multi_swap_paths:
+                            found_paths = st.session_state.multi_swap_paths
+                            st.success(f"找到 {len(found_paths)} 條符合「{sel_src4.split('|')[1].strip()}」的循環！")
+                            
+                            paths_by_len = defaultdict(list)
+                            for p_list in found_paths:
+                                paths_by_len[len(p_list)].append(p_list)
+                            
+                            for length in sorted(paths_by_len.keys()):
+                                st.subheader(f"🔄 {length} 人循環調課")
+                                
+                                for idx, p_list in enumerate(paths_by_len[length]):
+                                    with st.container(border=True):
+                                        c_info, c_btn = st.columns([5, 1])
+                                        
+                                        persons = [who_a4] + [step['to'] for step in p_list]
+                                        chain_str = " ➔ ".join(persons)
+                                        
+                                        first_content = sel_src4.split('|')[1].strip()
+                                        desc_list = []
+                                        # 第一步
+                                        desc_list.append(f"<b>1. {who_a4}</b> 釋出 週{p_list[0]['day']}{p_list[0]['period']} ({first_content})")
+                                        # 中間步
+                                        for i in range(1, len(p_list)):
+                                            step = p_list[i]
+                                            prev_person = p_list[i-1]['to']
+                                            desc_list.append(f"<b>{i+1}. {prev_person}</b> 釋出 週{step['day']}{step['period']} ({step['content']})")
+                                        
+                                        final_desc = "  ➡️  ".join(desc_list)
+                                        
+                                        with c_info:
+                                            st.markdown(f"**{chain_str}**")
+                                            st.markdown(final_desc, unsafe_allow_html=True)
+                                        
+                                        with c_btn:
+                                            if st.button("👁️ 檢視", key=f"btn_{length}_{idx}"):
+                                                show_multi_path_visual(p_list, df)
 
 if __name__ == "__main__":
     main()
