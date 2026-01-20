@@ -6,7 +6,7 @@ import streamlit.components.v1 as components
 # ==========================================
 # 0. 系統設定
 # ==========================================
-st.set_page_config(page_title="成德高中 智慧調代課系統 v30", layout="wide")
+st.set_page_config(page_title="成德高中 智慧調代課系統 v31", layout="wide")
 
 # ==========================================
 # 1. 核心邏輯：欣河系統解析
@@ -19,9 +19,7 @@ def parse_xinhe_csv(uploaded_file):
         uploaded_file.seek(0)
         df = pd.read_csv(uploaded_file, encoding='cp950', header=None, on_bad_lines='skip')
     
-    # 清洗資料
     df = df.fillna("").astype(str)
-    
     all_data = []
     current_teacher = None
     day_col_map = {}
@@ -125,14 +123,11 @@ def parse_xinhe_csv(uploaded_file):
 # 2. 領域判定邏輯
 # ==========================================
 def determine_domain(teacher_name, df):
-    # 手動修正名單
     manual_fix = {
         "王安順": "自然",
         "黃琮琪": "自然",
     }
-    
-    if teacher_name in manual_fix:
-        return manual_fix[teacher_name]
+    if teacher_name in manual_fix: return manual_fix[teacher_name]
 
     subjects = df[(df['teacher'] == teacher_name) & (df['subject'] != "")]['subject'].unique()
     all_subjects_str = "".join([str(s) for s in subjects])
@@ -158,10 +153,8 @@ def determine_domain(teacher_name, df):
                 scores[domain] += all_subjects_str.count(kw)
     
     best_domain = max(scores, key=scores.get)
-    
     if scores[best_domain] == 0:
         return "其他" if len(all_subjects_str) > 0 else "未知"
-    
     return best_domain
 
 # ==========================================
@@ -252,7 +245,7 @@ def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
 # 3. 主程式 UI
 # ==========================================
 def main():
-    st.title("🏫 成德高中 智慧調代課系統 v30")
+    st.title("🏫 成德高中 智慧調代課系統 v31")
     
     if 'data_loaded' not in st.session_state: st.session_state.data_loaded = False
     if 'swap_results' not in st.session_state: st.session_state.swap_results = None
@@ -273,37 +266,27 @@ def main():
         if df.empty:
             st.error("讀取失敗。")
         else:
-            # --- 建立領域 (Domain) 映射 ---
+            # --- Domain Map ---
             teacher_domain_map = {}
             for t in df['teacher'].unique():
-                domain = determine_domain(t, df)
-                teacher_domain_map[t] = domain
-
+                teacher_domain_map[t] = determine_domain(t, df)
             teacher_display_map = {t: f"{t} ({d})" for t, d in teacher_domain_map.items()}
-
-            all_domains = sorted(list(set(teacher_domain_map.values())))
-            if "未知" in all_domains: all_domains.remove("未知")
-            all_domains = ["全部"] + all_domains
-
+            all_domains = ["全部"] + sorted([d for d in set(teacher_domain_map.values()) if d != "未知"])
+            
+            # --- Class List ---
             unique_classes = df['class_name'].unique()
-            clean_classes = [str(c) for c in unique_classes if pd.notna(c) and str(c).strip() != ""]
-            all_classes = sorted(clean_classes)
-
+            clean_classes = sorted([str(c) for c in unique_classes if pd.notna(c) and str(c).strip() != ""])
             all_teachers_real = sorted(df['teacher'].unique())
 
             # --- Tabs ---
             tab1, tab2, tab3 = st.tabs(["📅 課表檢視", "🚑 尋找空堂", "🔄 互換調課"])
 
-            # Tab 1: 課表檢視 (更新：加入科別篩選)
+            # Tab 1
             with tab1:
                 col_d, col_t = st.columns([1, 2])
-                with col_d:
-                    t1_domain = st.selectbox("篩選領域", all_domains, key="t1_dom")
+                with col_d: t1_domain = st.selectbox("篩選領域", all_domains, key="t1_dom")
                 with col_t:
-                    if t1_domain == "全部":
-                        t1_opts = sorted(teacher_display_map.values())
-                    else:
-                        t1_opts = sorted([v for k, v in teacher_display_map.items() if teacher_domain_map[k] == t1_domain])
+                    t1_opts = sorted(teacher_display_map.values()) if t1_domain == "全部" else sorted([v for k, v in teacher_display_map.items() if teacher_domain_map[k] == t1_domain])
                     t_sel_display = st.selectbox("選擇教師", t1_opts, key="t1_who")
 
                 if t_sel_display:
@@ -313,55 +296,31 @@ def main():
                     pivot = pivot.reindex([str(i) for i in range(1,9)]).reindex(columns=["一","二","三","四","五"]).fillna("")
                     st.dataframe(pivot, use_container_width=True)
 
-            # Tab 2: 尋找空堂 (更新：加入科別/姓名篩選器)
+            # Tab 2
             with tab2:
                 st.subheader("1. 設定缺課時段")
                 c1, c2 = st.columns(2)
                 q_day = c1.selectbox("缺課星期", ["一","二","三","四","五"])
                 q_per = c2.selectbox("缺課節次", [str(i) for i in range(1,9)])
-                
-                # 先找出所有空堂老師
                 frees = df[(df['day']==q_day) & (df['period']==q_per) & (df['is_free'] == "True")]
                 
                 st.divider()
                 st.subheader("2. 篩選空堂名單")
-                
-                # 加入篩選器
                 c3, c4 = st.columns([1, 2])
-                with c3:
-                    t2_domain = st.selectbox("篩選領域 (科別)", all_domains, key="t2_dom")
+                with c3: t2_domain = st.selectbox("篩選領域 (科別)", all_domains, key="t2_dom")
                 with c4:
-                    # 根據「空堂名單」和「科別」動態產生姓名選單
-                    # 先過濾領域
-                    if t2_domain == "全部":
-                        # 只顯示「目前有空」的老師
-                        available_teachers = sorted(frees['teacher'].unique())
-                    else:
-                        available_teachers = sorted([t for t in frees['teacher'].unique() if teacher_domain_map[t] == t2_domain])
-                    
-                    # 轉成顯示名稱
+                    available_teachers = sorted(frees['teacher'].unique()) if t2_domain == "全部" else sorted([t for t in frees['teacher'].unique() if teacher_domain_map[t] == t2_domain])
                     available_display = [teacher_display_map[t] for t in available_teachers]
-                    
-                    # 姓名選單 (增加「全部」選項)
                     t2_name_filter = st.selectbox("篩選特定教師 (可選)", ["全部顯示"] + available_display, key="t2_who")
 
-                # 應用篩選結果
                 if not frees.empty:
                     final_frees = frees.copy()
-                    
-                    # 1. 領域過濾
                     if t2_domain != "全部":
-                        # 找出該領域的老師名單
-                        domain_teachers = [k for k, v in teacher_domain_map.items() if v == t2_domain]
-                        final_frees = final_frees[final_frees['teacher'].isin(domain_teachers)]
-                    
-                    # 2. 姓名過濾
+                        final_frees = final_frees[final_frees['teacher'].isin([k for k,v in teacher_domain_map.items() if v==t2_domain])]
                     if t2_name_filter != "全部顯示":
-                        # 反查真實姓名
                         target_real = [k for k, v in teacher_display_map.items() if v == t2_name_filter][0]
                         final_frees = final_frees[final_frees['teacher'] == target_real]
 
-                    # 顯示結果
                     if not final_frees.empty:
                         st.success(f"符合條件的空堂教師共 {len(final_frees)} 位：")
                         final_frees['display_name'] = final_frees['teacher'].map(teacher_display_map)
@@ -369,27 +328,19 @@ def main():
                     else:
                         st.warning("在此篩選條件下，無空堂教師。")
                 else:
-                    st.warning("該時段全校皆有課，無空堂教師。")
+                    st.warning("該時段全校皆有課。")
 
-            # Tab 3: 互換調課 (維持 v29 的完美狀態)
+            # Tab 3
             with tab3:
                 st.markdown("### 🔄 課程互換計算機")
-                
                 col_sub, col_tea = st.columns([1, 2])
-                with col_sub:
-                    filter_domain = st.selectbox("1. 篩選領域 (科別)", all_domains, key="t3_dom")
-                
+                with col_sub: filter_domain = st.selectbox("1. 篩選領域 (科別)", all_domains, key="t3_dom")
                 with col_tea:
-                    if filter_domain == "全部":
-                        filtered_teachers = sorted(teacher_display_map.values())
-                    else:
-                        filtered_teachers = sorted([v for k, v in teacher_display_map.items() if teacher_domain_map[k] == filter_domain])
-                    
+                    filtered_teachers = sorted(teacher_display_map.values()) if filter_domain == "全部" else sorted([v for k, v in teacher_display_map.items() if teacher_domain_map[k] == filter_domain])
                     who_a_display = st.selectbox("2. 我是 (A老師)", filtered_teachers, key="t3_who")
                 
                 if who_a_display:
                     who_a = [k for k, v in teacher_display_map.items() if v == who_a_display][0]
-                    
                     with st.expander(f"查看 {who_a} 的課表", expanded=False):
                         a_full_df = df[df['teacher'] == who_a]
                         a_pivot = a_full_df.pivot(index='period', columns='day', values='content')
@@ -402,60 +353,91 @@ def main():
                         a_busy = df[(df['teacher']==who_a) & (df['is_free'] == "False")]
                         src_opts = []
                         a_src_class_map = {} 
-                        
+                        # 取得 A 老師所有任課班級 (Set)
+                        my_teaching_classes = set()
+
                         if not a_busy.empty:
                             for _, r in a_busy.iterrows():
                                 opt_str = f"週{r['day']} 第{r['period']}節 | {r['content']}"
                                 src_opts.append(opt_str)
                                 a_src_class_map[opt_str] = r['class_name']
-                                
+                                if r['class_name']: my_teaching_classes.add(r['class_name'])
                         sel_src = st.selectbox("我的調出課程", src_opts)
 
                     with col_b:
                         st.info("步驟 2：選擇您想換過去的時間")
                         a_free = df[(df['teacher']==who_a) & (df['is_free'] == "True") & (df['period'] != '8')]
-                        tgt_opts = [f"週{r['day']} 第{r['period']}節" for _, r in a_free.iterrows()]
+                        # 新增「不指定」選項
+                        tgt_opts = ["不指定"] + [f"週{r['day']} 第{r['period']}節" for _, r in a_free.iterrows()]
                         sel_tgt = st.selectbox("我的調入時間 (空堂)", tgt_opts)
 
                     st.markdown("---")
                     st.markdown("#### 🛠️ 進階篩選 (選填)")
                     col_f1, col_f2, col_f3, col_f4 = st.columns(4)
-                    with col_f1:
-                        filter_teacher = st.selectbox("指定 B 老師", ["不指定"] + [t for t in all_teachers_real if t != who_a])
-                    with col_f2:
-                        filter_class = st.selectbox("指定 B 的班級", ["不指定"] + all_classes)
-                    with col_f3:
-                        filter_b_day = st.selectbox("指定 B 的課程星期", ["不指定", "一", "二", "三", "四", "五"])
-                    with col_f4:
-                        filter_b_per = st.selectbox("指定 B 的課程節次", ["不指定"] + [str(i) for i in range(1,9)])
+                    with col_f1: filter_teacher = st.selectbox("指定 B 老師", ["不指定"] + [t for t in all_teachers_real if t != who_a])
+                    with col_f2: 
+                        # 新增「我的任課班級」選項
+                        my_classes_sorted = sorted(list(my_teaching_classes))
+                        special_class_opt = "⭐ 我的任課班級"
+                        filter_class = st.selectbox("指定 B 的班級", ["不指定", special_class_opt] + clean_classes)
+                    with col_f3: filter_b_day = st.selectbox("指定 B 的課程星期", ["不指定", "一", "二", "三", "四", "五"])
+                    with col_f4: filter_b_per = st.selectbox("指定 B 的課程節次", ["不指定"] + [str(i) for i in range(1,9)])
 
                     st.divider()
 
                     if sel_src and sel_tgt:
                         s_day = re.search(r"週(.)", sel_src).group(1)
                         s_per = re.search(r"第(\d)", sel_src).group(1)
-                        t_day = re.search(r"週(.)", sel_tgt).group(1)
-                        t_per = re.search(r"第(\d)", sel_tgt).group(1)
                         my_src_class = a_src_class_map.get(sel_src, "")
 
+                        # 解析調入時間 (若選不指定，則為 None)
+                        if sel_tgt != "不指定":
+                            t_day = re.search(r"週(.)", sel_tgt).group(1)
+                            t_per = re.search(r"第(\d)", sel_tgt).group(1)
+                        else:
+                            t_day, t_per = None, None
+
                         if st.button("🔍 搜尋可互換對象"):
+                            # 1. 找 B: 在 A 的調出時間 (Source) 為空堂
                             cands = df[(df['day']==s_day) & (df['period']==s_per) & (df['is_free'] == "True") & (df['teacher']!=who_a)]
-                            if filter_teacher != "不指定":
-                                cands = cands[cands['teacher'] == filter_teacher]
-                            
+                            if filter_teacher != "不指定": cands = cands[cands['teacher'] == filter_teacher]
                             cand_teachers = cands['teacher'].unique()
                             
                             results = []
                             for b in cand_teachers:
-                                b_crs = df[(df['teacher']==b) & (df['day']==t_day) & (df['period']==t_per)]
-                                if not b_crs.empty and b_crs.iloc[0]['is_free'] == "False":
-                                    row_data = b_crs.iloc[0]
+                                # 2. 找 B: 在 A 的調入時間 (Target) 有課
+                                # 如果是「不指定」，則 B 任何一堂非空堂的課，只要該時間 A 是空堂，都算符合
+                                if t_day and t_per:
+                                    # 指定模式
+                                    b_crs = df[(df['teacher']==b) & (df['day']==t_day) & (df['period']==t_per)]
+                                else:
+                                    # 不指定模式：找出 B 所有有課的時段
+                                    b_crs = df[(df['teacher']==b) & (df['is_free'] == "False")]
+                                
+                                # 遍歷 B 的潛在課程
+                                for _, row_data in b_crs.iterrows():
+                                    # 在不指定模式下，要檢查這個時間點 A 是否為空堂 (且不是第八節)
+                                    if not t_day:
+                                        # 檢查 A 在 row_data['day'], row_data['period'] 是否有空
+                                        a_check = a_free[(a_free['day'] == row_data['day']) & (a_free['period'] == row_data['period'])]
+                                        if a_check.empty: continue # A 沒空，跳過
+
+                                    # 確保 B 這堂是有課的 (非空堂)
+                                    if row_data['is_free'] == "True": continue
+
                                     b_class = row_data['class_name']
                                     
-                                    if filter_class != "不指定" and b_class != filter_class: continue
+                                    # 3. 篩選班級
+                                    if filter_class == "⭐ 我的任課班級":
+                                        if b_class not in my_teaching_classes: continue
+                                    elif filter_class != "不指定" and b_class != filter_class:
+                                        continue
+
+                                    # 篩選星期/節次 (僅在不指定模式下有用，因為指定模式下一定符合)
                                     if filter_b_day != "不指定" and row_data['day'] != filter_b_day: continue
                                     if filter_b_per != "不指定" and row_data['period'] != filter_b_per: continue
 
+                                    # 4. 標記
                                     mark = ""
                                     if my_src_class and b_class and my_src_class == b_class:
                                         mark = "⭐"
@@ -465,8 +447,8 @@ def main():
                                         "教師": b,
                                         "課程名稱": row_data['subject'],
                                         "班級": b_class,
-                                        "還課星期": t_day,
-                                        "還課節次": t_per,
+                                        "還課星期": row_data['day'],
+                                        "還課節次": row_data['period'],
                                         "_sort_score": 1 if mark else 0
                                     })
                             
@@ -477,7 +459,7 @@ def main():
 
                         if st.session_state.swap_results is not None:
                             if not st.session_state.swap_results.empty:
-                                st.success(f"找到 {len(st.session_state.swap_results)} 位可互換教師！")
+                                st.success(f"找到 {len(st.session_state.swap_results)} 個可互換方案！")
                                 event = st.dataframe(
                                     st.session_state.swap_results, 
                                     use_container_width=True, 
@@ -486,17 +468,10 @@ def main():
                                     hide_index=True,
                                     key="swap_table"
                                 )
-                                
                                 if len(event.selection.rows) > 0:
                                     selected_idx = event.selection.rows[0]
                                     selected_row = st.session_state.swap_results.iloc[selected_idx]
-                                    show_swap_dialog(
-                                        selected_row['教師'], 
-                                        selected_row, 
-                                        who_a_display,
-                                        sel_src, 
-                                        df
-                                    )
+                                    show_swap_dialog(selected_row['教師'], selected_row, who_a_display, sel_src, df)
                             else:
                                 st.warning("無符合條件的互換對象。")
 
