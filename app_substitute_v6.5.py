@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
 import re
+import datetime
 import streamlit.components.v1 as components
 
 # ==========================================
 # 0. 系統設定
 # ==========================================
-st.set_page_config(page_title="成德高中 智慧調代課系統 v31", layout="wide")
+st.set_page_config(page_title="成德高中 智慧調代課系統 v33", layout="wide")
 
 # ==========================================
 # 1. 核心邏輯：欣河系統解析
@@ -158,12 +159,13 @@ def determine_domain(teacher_name, df):
     return best_domain
 
 # ==========================================
-# 3. 彈出視窗與通知單
+# 3. 彈出視窗與通知單 (核心修改處)
 # ==========================================
 @st.dialog("課程互換與通知單", width="large")
 def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
     st.subheader(f"🤝 與 {teacher_b} 老師的互換詳情")
     
+    # 顯示 B 老師課表
     st.markdown(f"**{teacher_b} 老師的課表：**")
     b_df = full_df[full_df['teacher'] == teacher_b]
     pivot = b_df.pivot(index='period', columns='day', values='content')
@@ -178,6 +180,7 @@ def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
 
     st.divider()
 
+    # 1. 解析原始字串資訊
     src_day = re.search(r"週(.)", source_info).group(1)
     src_per = re.search(r"第(\d)", source_info).group(1)
     src_content = source_info.split("|")[1].strip()
@@ -191,16 +194,42 @@ def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
     tgt_per = b_row['還課節次']
     tgt_subj = b_row['課程名稱']
     tgt_cls = b_row['班級']
-
+    
     a_name_only = teacher_a.split(" (")[0]
     b_name_only = teacher_b
 
+    # ==========================
+    # v33 新增：日期控制區
+    # ==========================
+    st.markdown("#### 📅 設定調課日期")
+    col_chk, col_da, col_db = st.columns([1, 2, 2])
+    
+    with col_chk:
+        st.write("") # Spacer
+        st.write("")
+        enable_date = st.checkbox("加入日期顯示", value=False)
+    
+    with col_da:
+        date_a = st.date_input(f"我 (A) 調出的日期 (週{src_day})", datetime.date.today())
+    
+    with col_db:
+        date_b = st.date_input(f"對方 (B) 還課的日期 (週{tgt_day})", datetime.date.today())
+
+    # 根據是否勾選，組合時間字串
+    if enable_date:
+        str_src_time = f"{date_a.strftime('%Y/%m/%d')} (星期{src_day} 第{src_per}節)"
+        str_tgt_time = f"{date_b.strftime('%Y/%m/%d')} (星期{tgt_day} 第{tgt_per}節)"
+    else:
+        str_src_time = f"星期{src_day} 第{src_per}節"
+        str_tgt_time = f"星期{tgt_day} 第{tgt_per}節"
+
+    # 產生通知單內容
     note_content = f"""{b_name_only} 老師您好：
 
-希望 星期{tgt_day} 第{tgt_per}節 {tgt_cls} ({tgt_subj}) 可以跟您換 星期{src_day} 第{src_per}節 {src_cls} ({src_subj})
+希望 {str_tgt_time} {tgt_cls} ({tgt_subj}) 可以跟您換 {str_src_time} {src_cls} ({src_subj})
 
-您上 星期{src_day} 第{src_per}節 {src_cls}
-我上 星期{tgt_day} 第{tgt_per}節 {tgt_cls}
+您上 {str_src_time} {src_cls}
+我上 {str_tgt_time} {tgt_cls}
 
 感謝您的協助！
 敬祝平安
@@ -245,7 +274,7 @@ def show_swap_dialog(teacher_b, b_row, teacher_a, source_info, full_df):
 # 3. 主程式 UI
 # ==========================================
 def main():
-    st.title("🏫 成德高中 智慧調代課系統 v31")
+    st.title("🏫 成德高中 智慧調代課系統 v33")
     
     if 'data_loaded' not in st.session_state: st.session_state.data_loaded = False
     if 'swap_results' not in st.session_state: st.session_state.swap_results = None
@@ -266,22 +295,20 @@ def main():
         if df.empty:
             st.error("讀取失敗。")
         else:
-            # --- Domain Map ---
+            # --- Map Setup ---
             teacher_domain_map = {}
             for t in df['teacher'].unique():
                 teacher_domain_map[t] = determine_domain(t, df)
             teacher_display_map = {t: f"{t} ({d})" for t, d in teacher_domain_map.items()}
             all_domains = ["全部"] + sorted([d for d in set(teacher_domain_map.values()) if d != "未知"])
-            
-            # --- Class List ---
             unique_classes = df['class_name'].unique()
             clean_classes = sorted([str(c) for c in unique_classes if pd.notna(c) and str(c).strip() != ""])
             all_teachers_real = sorted(df['teacher'].unique())
 
             # --- Tabs ---
-            tab1, tab2, tab3 = st.tabs(["📅 課表檢視", "🚑 尋找空堂", "🔄 互換調課"])
+            tab1, tab2, tab3, tab4 = st.tabs(["📅 課表檢視", "🚑 尋找空堂", "🔄 雙人互換", "🔀 三角多角調"])
 
-            # Tab 1
+            # Tab 1: 課表檢視
             with tab1:
                 col_d, col_t = st.columns([1, 2])
                 with col_d: t1_domain = st.selectbox("篩選領域", all_domains, key="t1_dom")
@@ -296,7 +323,7 @@ def main():
                     pivot = pivot.reindex([str(i) for i in range(1,9)]).reindex(columns=["一","二","三","四","五"]).fillna("")
                     st.dataframe(pivot, use_container_width=True)
 
-            # Tab 2
+            # Tab 2: 尋找空堂
             with tab2:
                 st.subheader("1. 設定缺課時段")
                 c1, c2 = st.columns(2)
@@ -315,8 +342,7 @@ def main():
 
                 if not frees.empty:
                     final_frees = frees.copy()
-                    if t2_domain != "全部":
-                        final_frees = final_frees[final_frees['teacher'].isin([k for k,v in teacher_domain_map.items() if v==t2_domain])]
+                    if t2_domain != "全部": final_frees = final_frees[final_frees['teacher'].isin([k for k,v in teacher_domain_map.items() if v==t2_domain])]
                     if t2_name_filter != "全部顯示":
                         target_real = [k for k, v in teacher_display_map.items() if v == t2_name_filter][0]
                         final_frees = final_frees[final_frees['teacher'] == target_real]
@@ -330,9 +356,9 @@ def main():
                 else:
                     st.warning("該時段全校皆有課。")
 
-            # Tab 3
+            # Tab 3: 雙人互換
             with tab3:
-                st.markdown("### 🔄 課程互換計算機")
+                st.markdown("### 🔄 雙人直接調課")
                 col_sub, col_tea = st.columns([1, 2])
                 with col_sub: filter_domain = st.selectbox("1. 篩選領域 (科別)", all_domains, key="t3_dom")
                 with col_tea:
@@ -341,6 +367,7 @@ def main():
                 
                 if who_a_display:
                     who_a = [k for k, v in teacher_display_map.items() if v == who_a_display][0]
+                    
                     with st.expander(f"查看 {who_a} 的課表", expanded=False):
                         a_full_df = df[df['teacher'] == who_a]
                         a_pivot = a_full_df.pivot(index='period', columns='day', values='content')
@@ -353,9 +380,7 @@ def main():
                         a_busy = df[(df['teacher']==who_a) & (df['is_free'] == "False")]
                         src_opts = []
                         a_src_class_map = {} 
-                        # 取得 A 老師所有任課班級 (Set)
                         my_teaching_classes = set()
-
                         if not a_busy.empty:
                             for _, r in a_busy.iterrows():
                                 opt_str = f"週{r['day']} 第{r['period']}節 | {r['content']}"
@@ -367,7 +392,6 @@ def main():
                     with col_b:
                         st.info("步驟 2：選擇您想換過去的時間")
                         a_free = df[(df['teacher']==who_a) & (df['is_free'] == "True") & (df['period'] != '8')]
-                        # 新增「不指定」選項
                         tgt_opts = ["不指定"] + [f"週{r['day']} 第{r['period']}節" for _, r in a_free.iterrows()]
                         sel_tgt = st.selectbox("我的調入時間 (空堂)", tgt_opts)
 
@@ -376,7 +400,6 @@ def main():
                     col_f1, col_f2, col_f3, col_f4 = st.columns(4)
                     with col_f1: filter_teacher = st.selectbox("指定 B 老師", ["不指定"] + [t for t in all_teachers_real if t != who_a])
                     with col_f2: 
-                        # 新增「我的任課班級」選項
                         my_classes_sorted = sorted(list(my_teaching_classes))
                         special_class_opt = "⭐ 我的任課班級"
                         filter_class = st.selectbox("指定 B 的班級", ["不指定", special_class_opt] + clean_classes)
@@ -390,7 +413,6 @@ def main():
                         s_per = re.search(r"第(\d)", sel_src).group(1)
                         my_src_class = a_src_class_map.get(sel_src, "")
 
-                        # 解析調入時間 (若選不指定，則為 None)
                         if sel_tgt != "不指定":
                             t_day = re.search(r"週(.)", sel_tgt).group(1)
                             t_per = re.search(r"第(\d)", sel_tgt).group(1)
@@ -398,49 +420,35 @@ def main():
                             t_day, t_per = None, None
 
                         if st.button("🔍 搜尋可互換對象"):
-                            # 1. 找 B: 在 A 的調出時間 (Source) 為空堂
                             cands = df[(df['day']==s_day) & (df['period']==s_per) & (df['is_free'] == "True") & (df['teacher']!=who_a)]
                             if filter_teacher != "不指定": cands = cands[cands['teacher'] == filter_teacher]
                             cand_teachers = cands['teacher'].unique()
                             
                             results = []
                             for b in cand_teachers:
-                                # 2. 找 B: 在 A 的調入時間 (Target) 有課
-                                # 如果是「不指定」，則 B 任何一堂非空堂的課，只要該時間 A 是空堂，都算符合
                                 if t_day and t_per:
-                                    # 指定模式
                                     b_crs = df[(df['teacher']==b) & (df['day']==t_day) & (df['period']==t_per)]
                                 else:
-                                    # 不指定模式：找出 B 所有有課的時段
                                     b_crs = df[(df['teacher']==b) & (df['is_free'] == "False")]
                                 
-                                # 遍歷 B 的潛在課程
                                 for _, row_data in b_crs.iterrows():
-                                    # 在不指定模式下，要檢查這個時間點 A 是否為空堂 (且不是第八節)
                                     if not t_day:
-                                        # 檢查 A 在 row_data['day'], row_data['period'] 是否有空
                                         a_check = a_free[(a_free['day'] == row_data['day']) & (a_free['period'] == row_data['period'])]
-                                        if a_check.empty: continue # A 沒空，跳過
-
-                                    # 確保 B 這堂是有課的 (非空堂)
+                                        if a_check.empty: continue
+                                    
                                     if row_data['is_free'] == "True": continue
 
                                     b_class = row_data['class_name']
-                                    
-                                    # 3. 篩選班級
                                     if filter_class == "⭐ 我的任課班級":
                                         if b_class not in my_teaching_classes: continue
                                     elif filter_class != "不指定" and b_class != filter_class:
                                         continue
 
-                                    # 篩選星期/節次 (僅在不指定模式下有用，因為指定模式下一定符合)
                                     if filter_b_day != "不指定" and row_data['day'] != filter_b_day: continue
                                     if filter_b_per != "不指定" and row_data['period'] != filter_b_per: continue
 
-                                    # 4. 標記
                                     mark = ""
-                                    if my_src_class and b_class and my_src_class == b_class:
-                                        mark = "⭐"
+                                    if my_src_class and b_class and my_src_class == b_class: mark = "⭐"
                                     
                                     results.append({
                                         "標記": mark,
@@ -474,6 +482,86 @@ def main():
                                     show_swap_dialog(selected_row['教師'], selected_row, who_a_display, sel_src, df)
                             else:
                                 st.warning("無符合條件的互換對象。")
+
+            # Tab 4: 多角調
+            with tab4:
+                st.markdown("### 🔀 三角循環調課 (A → B → C → A)")
+                st.info("說明：若找不到直接互換的對象，可嘗試此功能。\n邏輯：A 把課給 B，B 把課給 C，C 把 A 想要的時段還給 A。")
+
+                col_sub4, col_tea4 = st.columns([1, 2])
+                with col_sub4: filter_domain4 = st.selectbox("1. 篩選領域", all_domains, key="t4_dom")
+                with col_tea4:
+                    filtered_teachers4 = sorted(teacher_display_map.values()) if filter_domain4 == "全部" else sorted([v for k, v in teacher_display_map.items() if teacher_domain_map[k] == filter_domain4])
+                    who_a_display4 = st.selectbox("2. 我是 (A老師)", filtered_teachers4, key="t4_who")
+
+                if who_a_display4:
+                    who_a4 = [k for k, v in teacher_display_map.items() if v == who_a_display4][0]
+                    
+                    c_src, c_tgt = st.columns(2)
+                    with c_src:
+                        st.warning("步驟 1：A 丟出")
+                        a_busy4 = df[(df['teacher']==who_a4) & (df['is_free'] == "False")]
+                        src_opts4 = []
+                        if not a_busy4.empty:
+                            for _, r in a_busy4.iterrows():
+                                src_opts4.append(f"週{r['day']} 第{r['period']}節 | {r['content']}")
+                        sel_src4 = st.selectbox("A 丟出的課 (給 B)", src_opts4, key="t4_src")
+
+                    with c_tgt:
+                        st.success("步驟 2：A 接收")
+                        a_free4 = df[(df['teacher']==who_a4) & (df['is_free'] == "True") & (df['period'] != '8')]
+                        tgt_opts4 = [f"週{r['day']} 第{r['period']}節" for _, r in a_free4.iterrows()]
+                        sel_tgt4 = st.selectbox("A 想要的空堂 (C 給)", tgt_opts4, key="t4_tgt")
+
+                    st.divider()
+
+                    if sel_src4 and sel_tgt4:
+                        if st.button("🚀 搜尋三角路徑"):
+                            s_day = re.search(r"週(.)", sel_src4).group(1)
+                            s_per = re.search(r"第(\d)", sel_src4).group(1)
+                            t_day = re.search(r"週(.)", sel_tgt4).group(1)
+                            t_per = re.search(r"第(\d)", sel_tgt4).group(1)
+                            
+                            candidates_b = df[(df['day']==s_day) & (df['period']==s_per) & (df['is_free'] == "True") & (df['teacher']!=who_a4)]['teacher'].unique()
+                            candidates_c_source = df[(df['day']==t_day) & (df['period']==t_per) & (df['is_free'] == "False") & (df['teacher']!=who_a4)]
+                            
+                            chain_results = []
+
+                            for b in candidates_b:
+                                b_busy_slots = df[(df['teacher']==b) & (df['is_free'] == "False")]
+                                for _, b_row in b_busy_slots.iterrows():
+                                    mid_day = b_row['day']
+                                    mid_per = b_row['period']
+                                    
+                                    valid_c_list = candidates_c_source[
+                                        (candidates_c_source['teacher'] != b) & 
+                                        (candidates_c_source['teacher'] != who_a4)
+                                    ]
+                                    
+                                    for _, c_row in valid_c_list.iterrows():
+                                        c_name = c_row['teacher']
+                                        c_is_free_at_mid = df[
+                                            (df['teacher'] == c_name) & 
+                                            (df['day'] == mid_day) & 
+                                            (df['period'] == mid_per) & 
+                                            (df['is_free'] == "True")
+                                        ]
+                                        
+                                        if not c_is_free_at_mid.empty:
+                                            chain_results.append({
+                                                "路徑預覽": f"{who_a4} ➔ {b} ➔ {c_name} ➔ {who_a4}",
+                                                "1. A給B": f"{s_day}{s_per} {sel_src4.split('|')[1]}",
+                                                "2. B給C": f"{mid_day}{mid_per} {b_row['content']}",
+                                                "3. C給A": f"{t_day}{t_per} {c_row['content']}",
+                                                "中間人(B)": b,
+                                                "收尾人(C)": c_name
+                                            })
+                            
+                            if chain_results:
+                                st.success(f"找到 {len(chain_results)} 條三角循環路徑！")
+                                st.dataframe(pd.DataFrame(chain_results), use_container_width=True)
+                            else:
+                                st.warning("找不到可行的三角路徑。")
 
 if __name__ == "__main__":
     main()
