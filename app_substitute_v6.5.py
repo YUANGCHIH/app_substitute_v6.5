@@ -5,477 +5,427 @@ import pandas as pd
 import re
 import json
 from datetime import date, timedelta
-import io
+
+# 設定頁面資訊
+st.set_page_config(page_title="成德高中 智慧調代課系統 v6.5", layout="wide")
 
 # ==========================================
-# 0. 系統設定
-# ==========================================
-st.set_page_config(page_title="成德高中 智慧調代課系統 v12.0", layout="wide")
-
-# ==========================================
-# 1. 核心邏輯：座標定位解析 (針對 114-2 優化)
+# 1. 資料清洗與輔助函式
 # ==========================================
 
-def clean_text_v12(text):
+def clean_cell_text_advanced(text):
     """
-    v12 專屬清洗：針對 114-2 PDF 的特殊亂碼進行淨化
+    強力清洗：清除黏在一起的節次、時間與雜訊
     """
-    if not text: return ""
-    # 移除波斯/阿拉伯語系亂碼 (您的 PDF 裡出現了 کم, کر)
-    text = re.sub(r'[\u0600-\u06FF]', '', text)
-    # 移除常見雜訊
-    text = text.replace("科目星", "").replace("時間班期", "").replace("時間", "").replace("班級", "")
-    # 移除時間格式 (避免誤判為課程)
+    if not isinstance(text, str) or not text:
+        return ""
+    
+    # 清除時間 (08:00, 9:00...)
     text = re.sub(r'\d{1,2}[:：]\d{2}', '', text)
-    # 移除多餘空白
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    # 清除「第 X 節」
+    text = re.sub(r'第\s*[0-9一二三四五六七八]\s*節', '', text)
+    
+    # 清除雜訊字詞
+    noise_words = ["早自習", "午休", "時間", "班級", "科目", "上", "下", "午", "課程", "星期"]
+    for w in noise_words:
+        text = text.replace(w, "")
+        
+    return text.replace("\n", " ").strip()
 
 def extract_class_and_course(content_str):
-    """分離班級與課程"""
+    """
+    分離班級與課程
+    """
     if not content_str: return "", ""
-    # 針對 "文 國一3" 或 "文\n國一3"
-    content_str = clean_text_v12(content_str)
-    
-    # 抓取班級 (高/國 + 一二三/- + 數字)
-    class_pattern = re.search(r'([高國][一二三\-]\s*\d+)', content_str)
+    class_pattern = re.search(r'([高國][一二三]\s*\d+)', content_str)
     if class_pattern:
-        raw_class = class_pattern.group(1)
-        class_code = raw_class.replace(" ", "").replace("-", "")
-        course_name = content_str.replace(raw_class, "").strip()
+        class_code = class_pattern.group(1).replace(" ", "")
+        course_name = content_str.replace(class_pattern.group(1), "").strip()
+        course_name = course_name.replace("_", " ").strip()
         return class_code, course_name
-    return "", content_str
-
-def get_teacher_name_v12(page, page_idx):
-    """
-    從頁面抓取教師姓名 (座標優先法)
-    """
-    words = page.extract_words(keep_blank_chars=True)
-    # 只看上面 20% 的區域
-    header_words = [w for w in words if w['top'] < page.height * 0.2]
-    
-    # 策略 1: 找 "教師" 關鍵字
-    for i, w in enumerate(header_words):
-        if "教師" in w['text']:
-            # 往後找字
-            raw_text = ""
-            for j in range(i, min(i+5, len(header_words))):
-                raw_text += header_words[j]['text']
-            
-            # 清洗並提取名字
-            match = re.search(r"教師[:：\s]*([^\d\s]+)", raw_text)
-            if match:
-                name = match.group(1)
-                # 移除職稱
-                for title in ["導師", "專任", "組長", "教師"]:
-                    name = name.replace(title, "")
-                if 1 < len(name) <= 5: return name
-
-    # 策略 2: 沒找到 "教師" 字眼，盲抓標題區塊的大字 (通常除了校名就是老師名)
-    for w in header_words:
-        txt = w['text'].replace(" ", "")
-        if len(txt) > 1 and len(txt) <= 4:
-            if not any(k in txt for k in ["成德", "課表", "學年", "列印", "版", "一", "二"]):
-                # 排除純數字
-                if not re.search(r'\d', txt):
-                    return txt
-
-    return f"Teacher_{page_idx+1}"
-
-def get_virtual_grid(page):
-    """
-    建立虛擬網格：不看表格線，只看文字座標 (GPS 定位)
-    """
-    words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=True)
-    width = page.width
-    height = page.height
-
-    # 1. 定位 X 軸 (星期)
-    # 搜尋 "一", "二", "三"...
-    day_anchors = {"一": None, "二": None, "三": None, "四": None, "五": None}
-    for w in words:
-        if w['top'] < height * 0.25: # 只在上方找標題
-            txt = w['text'].strip()
-            for d in day_anchors.keys():
-                if d in txt and day_anchors[d] is None:
-                    day_anchors[d] = (w['x0'], w['x1']) # 記下左右邊界
-
-    # 如果抓不到標題 (PDF太爛)，用盲猜 (平均切分頁面寬度)
-    cols = []
-    found_days = [d for d, pos in day_anchors.items() if pos is not None]
-    
-    if len(found_days) < 3:
-        # 盲猜模式：假設左邊 15% 是節次，剩下 85% 分給 5 天
-        start_x = width * 0.15
-        step = (width - start_x) / 5
-        for i, d in enumerate(["一", "二", "三", "四", "五"]):
-            cols.append({"day": d, "x0": start_x + i*step, "x1": start_x + (i+1)*step})
     else:
-        # 根據抓到的座標推算中間線
-        sorted_days = sorted([d for d in day_anchors.items() if d[1]], key=lambda x: x[1][0])
-        for i in range(len(sorted_days)):
-            d, (x0, x1) = sorted_days[i]
-            # 左邊界
-            if i == 0: left = x0 - 20
-            else: left = (sorted_days[i-1][1][1] + x0) / 2
-            # 右邊界
-            if i == len(sorted_days) - 1: right = width
-            else: right = (x1 + sorted_days[i+1][1][0]) / 2
-            cols.append({"day": d, "x0": left, "x1": right})
+        return "", content_str
 
-    # 2. 定位 Y 軸 (節次)
-    # 搜尋時間 "08:", "09:"...
-    time_anchors = {}
-    time_kws = {
-        "1": ["08:", "8:", "第一節"], "2": ["09:", "9:", "第二節"],
-        "3": ["10:", "10", "第三節"], "4": ["11:", "11", "第四節"],
-        "5": ["13:", "12:", "第五節"], "6": ["14:", "14", "第六節"],
-        "7": ["15:", "15", "第七節"], "8": ["16:", "16", "第八節"]
-    }
-    
-    for w in words:
-        txt = w['text'].replace(" ", "")
-        for p, kws in time_kws.items():
-            if p not in time_anchors:
-                for kw in kws:
-                    if kw in txt:
-                        time_anchors[p] = (w['top'], w['bottom'])
-                        break
-    
-    rows = []
-    # 檢查是否抓到足夠的節次，不夠就盲猜
-    if len(time_anchors) < 4:
-        # 盲猜模式
-        start_y = height * 0.25
-        step_y = (height * 0.7) / 8
-        for i in range(1, 9):
-            top = start_y + (i-1)*step_y
-            rows.append({"period": str(i), "top": top, "bottom": top + step_y})
-    else:
-        # 填補空缺的節次 (線性插值)
-        sorted_ps = sorted(time_anchors.keys(), key=lambda x: int(x))
-        for i in range(1, 9):
-            p = str(i)
-            if p in time_anchors:
-                top, bottom = time_anchors[p]
-                # 擴大一點範圍
-                rows.append({"period": p, "top": top - 5, "bottom": bottom + 40})
-            else:
-                # 如果這節沒抓到 (例如午休後)，用推算的
-                if rows:
-                    prev = rows[-1]
-                    step = prev['bottom'] - prev['top']
-                    rows.append({"period": p, "top": prev['bottom'], "bottom": prev['bottom'] + step})
-                else:
-                    rows.append({"period": p, "top": 150, "bottom": 200})
+@st.cache_data
+def get_teacher_list(df):
+    return sorted(df['teacher'].unique())
 
-    return cols, rows, words
+# ==========================================
+# 2. PDF 解析核心
+# ==========================================
 
-def parse_pdf_v12(uploaded_file):
+@st.cache_data
+def parse_pdf_v6_5(uploaded_file):
     extracted_data = []
-    teacher_classes_map = {}
+    teacher_classes_map = {} 
+    
+    time_keywords = {
+        "1": ["第一節", "08:00", "8:00"], "2": ["第二節", "09:00", "9:00"],
+        "3": ["第三節", "10:00"], "4": ["第四節", "11:00"],
+        "5": ["第五節", "13:00"], "6": ["第六節", "14:00"],
+        "7": ["第七節", "15:00"], "8": ["第八節", "16:00"]
+    }
+    day_keywords = ["一", "二", "三", "四", "五"]
 
     with pdfplumber.open(uploaded_file) as pdf:
         for i, page in enumerate(pdf.pages):
-            # 1. 抓老師名字
-            teacher_name = get_teacher_name_v12(page, i)
+            text = page.extract_text() or ""
+            tables = page.extract_tables()
+            
+            teacher_name = f"Teacher_{i}"
+            match = re.search(r"教師[:：\s]+(\S+)", text)
+            if match:
+                name_candidate = match.group(1).strip()
+                if "總時數" not in name_candidate and len(name_candidate) < 10:
+                    teacher_name = name_candidate
+            
             if teacher_name not in teacher_classes_map:
                 teacher_classes_map[teacher_name] = set()
 
-            # 2. 建立座標網格
-            cols, rows, all_words = get_virtual_grid(page)
+            if not tables: continue
+            raw_table = tables[0]
+            
+            col_map = {} 
+            row_map = {} 
 
-            # 3. 將文字投入網格 (Bucket Sorting)
-            grid_buckets = {}
-            for w in all_words:
-                w_cx = (w['x0'] + w['x1']) / 2
-                w_cy = (w['top'] + w['bottom']) / 2
-                
-                # 判定星期
-                m_day = None
-                for c in cols:
-                    if c['x0'] <= w_cx <= c['x1']:
-                        m_day = c['day']
-                        break
-                
-                # 判定節次
-                m_period = None
-                for r in rows:
-                    if r['top'] <= w_cy <= r['bottom']:
-                        m_period = r['period']
-                        break
-                
-                if m_day and m_period:
-                    key = f"{m_day}_{m_period}"
-                    if key not in grid_buckets: grid_buckets[key] = []
-                    grid_buckets[key].append(w['text'])
+            for r_idx, row in enumerate(raw_table[:4]):
+                for c_idx, cell in enumerate(row):
+                    cell_str = str(cell).replace("\n", "").strip()
+                    for d in day_keywords:
+                        if d in cell_str and len(cell_str) < 5: col_map[c_idx] = d
+            
+            for r_idx, row in enumerate(raw_table):
+                row_text = "".join([str(c) for c in row if c]).replace(" ", "").replace("\n", "")
+                for p_key, kws in time_keywords.items():
+                    for kw in kws:
+                        if kw in row_text:
+                            row_map[r_idx] = p_key
+                            break
+            
+            for r_idx, period in row_map.items():
+                for c_idx, day in col_map.items():
+                    if c_idx < len(raw_table[r_idx]):
+                        raw_cell = str(raw_table[r_idx][c_idx])
+                        clean_content = clean_cell_text_advanced(raw_cell)
+                        is_free = (len(clean_content) < 2)
+                        
+                        extracted_data.append({
+                            "teacher": teacher_name, "day": day, "period": period,
+                            "content": clean_content, "is_free": is_free
+                        })
+                        
+                        cls, _ = extract_class_and_course(clean_content)
+                        if cls: teacher_classes_map[teacher_name].add(cls)
 
-            # 4. 整理數據
-            for r in rows:
-                p = r['period']
-                for c in cols:
-                    d = c['day']
-                    key = f"{d}_{p}"
-                    raw_list = grid_buckets.get(key, [])
-                    
-                    # 合併並清洗
-                    full_text = " ".join(raw_list)
-                    clean_content = clean_text_v12(full_text)
-                    
-                    # 過濾掉可能是 Header 殘留的字
-                    if clean_content in ["一", "二", "三", "四", "五", "午休", "早自習"]:
-                        clean_content = ""
-                    
-                    is_free = (len(clean_content) < 1)
-                    
-                    extracted_data.append({
-                        "teacher": teacher_name, "day": d, "period": p,
-                        "content": clean_content, "is_free": is_free
-                    })
-                    
-                    # 抓班級
-                    cls, _ = extract_class_and_course(clean_content)
-                    if cls: teacher_classes_map[teacher_name].add(cls)
-
-            # 5. 補科目 (多數決)
+            # 補科目邏輯
+            subject = "綜合"
             all_content = " ".join([d['content'] for d in extracted_data if d['teacher'] == teacher_name])
-            subj = "綜合"
-            sk = {"國語文":"國文","英文":"英文","數學":"數學","物理":"自然","化學":"自然","生物":"自然","地科":"自然","歷史":"社會","地理":"社會","公民":"社會","體育":"健體","美術":"藝能","音樂":"藝能","資訊":"科技","生科":"科技","全民國防":"國防","護理":"健體","語文":"國文"}
-            dc = {}
-            for k,v in sk.items(): 
-                if k in all_content: dc[v] = dc.get(v,0)+1
-            if dc: subj = max(dc, key=dc.get)
+            subject_keywords = {
+                "國語文": "國文", "英文": "英文", "數學": "數學", "物理": "自然", "化學": "自然", 
+                "生物": "自然", "地科": "自然", "歷史": "社會", "地理": "社會", "公民": "社會",
+                "體育": "健體", "美術": "藝能", "音樂": "藝能", "資訊": "科技", "生科": "科技",
+                "全民國防": "國防", "護理": "健體"
+            }
+            detected_counts = {}
+            for k, v in subject_keywords.items():
+                if k in all_content: detected_counts[v] = detected_counts.get(v, 0) + 1
+            if detected_counts: subject = max(detected_counts, key=detected_counts.get)
             
             for item in extracted_data:
-                if item['teacher'] == teacher_name: item['subject'] = subj
-
+                if item['teacher'] == teacher_name: item['subject'] = subject
+                
     return extracted_data, teacher_classes_map
 
 # ==========================================
-# 2. 標準 Excel 支援 (當 PDF 真的不行時的備案)
+# 3. 彈出視窗與列印
 # ==========================================
-def get_template_excel():
-    data = {"教師姓名": ["陳慧敏"], "星期": ["一"], "節次": ["1"], "課程內容": ["國文 國一1"]}
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pd.DataFrame(data).to_excel(writer, index=False)
-    return output.getvalue()
 
-def parse_excel_standard(file):
-    try:
-        df = pd.read_excel(file).astype(str)
-        df.columns = [c.strip() for c in df.columns]
-        data, t_map = [], {}
-        for _, r in df.iterrows():
-            t, d, p, c = r.get("教師姓名",""), r.get("星期",""), r.get("節次",""), r.get("課程內容","")
-            if t == "nan": continue
-            c = c.replace("nan", "")
-            p = re.sub(r'[第節]', '', str(p).split('.')[0])
-            data.append({"teacher":t, "day":d, "period":p, "content":c, "is_free":len(c)<1})
-            if t not in t_map: t_map[t] = set()
-            cls, _ = extract_class_and_course(c)
-            if cls: t_map[t].add(cls)
-        # 補科目 (略)
-        return data, t_map
-    except: return [], {}
-
-# ==========================================
-# 3. UI 元件：彈出視窗與列印
-# ==========================================
 @st.dialog("調課詳細資訊", width="large")
-def show_popup(target_t, df, init_name, src, tgt):
+def show_schedule_popup(target_teacher, full_df, initiator_name, source_details, target_details):
+    
     st.subheader("📆 設定調課日期")
     c1, c2 = st.columns(2)
-    da = c1.date_input(f"A ({init_name}) 日期", value=date.today()+timedelta(days=1))
-    db = c2.date_input(f"B ({target_t}) 日期", value=date.today()+timedelta(days=2))
+    with c1:
+        default_date_a = date.today() + timedelta(days=1)
+        date_a = st.date_input(f"A老師 ({initiator_name}) 調課日期", value=default_date_a)
+        str_date_a = date_a.strftime("%Y/%m/%d")
+    with c2:
+        default_date_b = date.today() + timedelta(days=2)
+        date_b = st.date_input(f"B老師 ({target_teacher}) 調課日期", value=default_date_b)
+        str_date_b = date_b.strftime("%Y/%m/%d")
+
+    st.divider()
+
+    st.subheader(f"📅 {target_teacher} 老師的週課表")
+    t_df = full_df[full_df['teacher'] == target_teacher]
+    
+    if not t_df.empty:
+        pivot_df = t_df.pivot(index='period', columns='day', values='content')
+        pivot_df = pivot_df.reindex([str(i) for i in range(1, 9)])
+        pivot_df = pivot_df.reindex(columns=["一", "二", "三", "四", "五"])
+
+        def highlight_target(val, row_idx, col_name):
+            if row_idx == target_details['period'] and col_name == target_details['day']:
+                return 'background-color: #ffcccc; color: #8b0000; font-weight: bold; border: 2px solid red;'
+            return ''
+
+        styled_df = pivot_df.style.apply(lambda x: pd.DataFrame(
+            [[highlight_target(x.iloc[i, j], pivot_df.index[i], pivot_df.columns[j]) 
+              for j in range(len(pivot_df.columns))] 
+             for i in range(len(pivot_df.index))],
+            index=pivot_df.index, columns=pivot_df.columns
+        ), axis=None)
+
+        st.dataframe(styled_df, use_container_width=True)
+        st.caption("🟥 紅色標記為您選定要交換的時段")
     
     st.divider()
-    st.subheader(f"📅 {target_t} 老師的週課表")
-    
-    # 畫課表
-    t_df = df[df['teacher'] == target_t].drop_duplicates(['day','period'])
-    if not t_df.empty:
-        pivot = t_df.pivot(index='period', columns='day', values='content')
-        pivot = pivot.reindex([str(i) for i in range(1,9)]).reindex(columns=["一","二","三","四","五"])
-        
-        # 紅框標註
-        def highlight(v, r, c):
-            if r == tgt['period'] and c == tgt['day']:
-                return 'background-color: #ffcccc; color: #8b0000; font-weight: bold; border: 3px solid red;'
-            return ''
-        
-        st.dataframe(pivot.style.apply(lambda x: pd.DataFrame([[highlight(x.iloc[i,j], pivot.index[i], pivot.columns[j]) for j in range(5)] for i in range(8)], index=pivot.index, columns=pivot.columns), axis=None), use_container_width=True)
 
-    # 訊息生成
-    src_str = f"{da.strftime('%Y/%m/%d')} (週{src['day']}) 第{src['period']}節 {src['class']} {src['course']}"
-    tgt_str = f"{db.strftime('%Y/%m/%d')} (週{tgt['day']}) 第{tgt['period']}節 {tgt['class']} {tgt['course']}"
-    msg = (f"{target_t} 老師您好：\n\n我是 {init_name}。\n"
-           f"想詢問您 **{tgt_str}** 是否方便與我 **{src_str}** 調換課程？\n\n"
-           "再麻煩您確認意願，感謝幫忙！🙏")
+    st.subheader("✉️ 調課邀請通知單")
     
-    st.subheader("✉️ 通知單預覽")
-    st.text_area("", value=msg, height=150)
+    source_str = f"{str_date_a} (週{source_details['day']}) 第{source_details['period']}節 {source_details['class']} {source_details['course']}"
+    target_str = f"{str_date_b} (週{target_details['day']}) 第{target_details['period']}節 {target_details['class']} {target_details['course']}"
 
+    msg_template = f"""{target_teacher} 老師您好：
+
+我是 {initiator_name}。
+想詢問您 **{target_str}** 是否方便與我 **{source_str}** 調換課程？
+
+再麻煩您確認意願，感謝幫忙！🙏"""
+
+    st.text_area("預覽內容", value=msg_template, height=150)
+    
     # 列印與關閉按鈕
-    c_p, c_c = st.columns(2)
-    with c_p:
-        print_html = f"""
-        <script>
-        function p(){{
-            var w=window.open('','','width=800,height=600');
-            w.document.write('<html><body style="font-family:sans-serif;padding:50px;line-height:1.6">');
-            w.document.write('<h2 style="text-align:center;border-bottom:2px solid #333;padding-bottom:10px">調課徵詢單</h2>');
-            w.document.write('<p><strong>致 {target_t} 老師：</strong></p>');
-            w.document.write('<p>我是 <strong>{init_name}</strong>。<br><br>想詢問您 <strong>{tgt_str}</strong><br>是否方便與我 <strong>{src_str}</strong> 調換？</p>');
-            w.document.write('<br><br><br><div style="text-align:right"><p>簽名：________________</p></div>');
-            w.document.write('</body></html>');
-            w.document.close();w.print();
-        }}
-        </script>
-        <button onclick="p()" style="width:100%;padding:10px;background:white;border:1px solid #ddd;border-radius:5px;cursor:pointer;">🖨️ 直接列印通知單</button>
-        """
-        components.html(print_html, height=50)
-    with c_c:
+    print_html = f"""
+    <div style="font-family: 'Microsoft JhengHei', sans-serif; padding: 40px; border: 2px solid #333; max-width: 600px; margin: 0 auto;">
+        <h2 style="text-align: center; border-bottom: 1px solid #aaa; padding-bottom: 10px;">成德高中 調課徵詢單</h2>
+        <p style="font-size: 16px; margin-top: 30px;"><strong>致 {target_teacher} 老師：</strong></p>
+        <p style="font-size: 16px; line-height: 1.8;">
+            我是 <strong>{initiator_name}</strong>。<br><br>
+            想詢問您 <strong>{target_str}</strong> <br>
+            是否方便與我 <strong>{source_str}</strong> 調換課程？<br><br>
+            再麻煩您確認意願，感謝幫忙！
+        </p>
+        <div style="margin-top: 50px; text-align: right;">
+            <p>簽名：___________________</p>
+            <p>日期：_____ 年 _____ 月 _____ 日</p>
+        </div>
+    </div>
+    """
+
+    js_code = f"""
+    <script>
+    function printSlip() {{
+        var printContent = {json.dumps(print_html)};
+        var win = window.open('', '', 'width=800,height=600');
+        win.document.write('<html><head><title>調課通知單</title></head><body>');
+        win.document.write(printContent);
+        win.document.write('</body></html>');
+        win.document.close();
+        win.print();
+    }}
+    </script>
+    <div style="display: flex; align-items: flex-start; height: 100%;">
+        <button onclick="printSlip()" style="
+            background-color: #ffffff; color: #31333F; padding: 0.25rem 0.75rem;
+            border: 1px solid rgba(49, 51, 63, 0.2); border-radius: 0.25rem; 
+            cursor: pointer; font-size: 1rem; line-height: 1.6;
+            width: 100%; height: 40px; display: flex; align-items: center; justify-content: center;">
+            🖨️ 直接列印通知單
+        </button>
+    </div>
+    """
+    
+    c_print, c_close = st.columns([1, 1])
+    with c_print: components.html(js_code, height=45) 
+    with c_close:
         if st.button("關閉視窗", use_container_width=True, type="secondary"):
+            st.session_state.table_reset_key += 1
             st.rerun()
 
 # ==========================================
-# 4. 主程式
+# 主程式
 # ==========================================
+
 def main():
-    st.title("🏫 成德高中 智慧調代課系統 v12.0")
-    st.caption("旗艦版：內建 GPS 座標定位解析 + 亂碼濾除引擎")
+    st.title("🏫 成德高中 智慧調代課系統 v6.5")
+    
+    if 'table_reset_key' not in st.session_state:
+        st.session_state.table_reset_key = 0
 
-    if 'reset_key' not in st.session_state: st.session_state.reset_key = 0
+    uploaded_file = st.sidebar.file_uploader("步驟 1: 上傳全校課表 PDF", type=["pdf"], key="uploader_v65")
 
-    with st.sidebar:
-        st.header("1. 資料來源")
-        mode = st.radio("模式", ["智慧解析 PDF", "標準 Excel 匯入"])
-        
-        df = pd.DataFrame()
-        t_map = {}
-        
-        if mode == "智慧解析 PDF":
-            uploaded = st.file_uploader("上傳 PDF", type=["pdf"], key="pdf_up")
-            if uploaded:
-                with st.spinner("啟動 GPS 座標定位分析..."):
-                    data, t_map = parse_pdf_v12(uploaded)
-                    if data:
-                        df = pd.DataFrame(data)
-                        st.success(f"成功！解析出 {len(df['teacher'].unique())} 位教師")
-                    else:
-                        st.error("解析失敗，請改用 Excel 匯入")
-        else:
-            st.download_button("下載範例 Excel", get_template_excel(), "example.xlsx")
-            uploaded = st.file_uploader("上傳 Excel", type=["xlsx"], key="xls_up")
-            if uploaded:
-                data, t_map = parse_excel_standard(uploaded)
-                if data: df = pd.DataFrame(data)
+    if uploaded_file:
+        with st.spinner("正在進行智慧解析 (v6.5 增強版)..."):
+            raw_data, teacher_classes_map = parse_pdf_v6_5(uploaded_file)
+            
+            if not raw_data:
+                st.error("無法解析 PDF，請確認檔案格式。")
+                return
+            
+            df = pd.DataFrame(raw_data)
+            df = df.groupby(['teacher', 'day', 'period'], as_index=False).agg({
+                'content': lambda x: ' '.join(set([s for s in x if s])),
+                'is_free': 'all',
+                'subject': 'first'
+            })
+            df['is_free'] = df['content'].apply(lambda x: len(x.strip()) < 1)
+            
+            st.success(f"解析完成！資料庫包含 {len(df['teacher'].unique())} 位教師。")
+            cached_teacher_list = get_teacher_list(df)
+            
+            # [新功能] 取得全校所有班級清單 (用於下拉選單)
+            all_classes = set()
+            for cls_set in teacher_classes_map.values():
+                all_classes.update(cls_set)
+            # 簡單排序 (讓高一1, 高一2... 排在一起)
+            def class_sort_key(s):
+                match = re.search(r'([高國])([一二三])(\d+)', s)
+                if match:
+                    grade_map = {'一': 1, '二': 2, '三': 3}
+                    return (match.group(1), grade_map.get(match.group(2), 9), int(match.group(3)))
+                return (s, 0, 0)
+            
+            try:
+                cached_class_list = sorted(list(all_classes), key=class_sort_key)
+            except:
+                cached_class_list = sorted(list(all_classes))
 
-        # 教師更名工具
-        if not df.empty:
-            with st.expander("🛠️ 修正教師姓名"):
-                all_t = sorted(df['teacher'].unique())
-                old = st.selectbox("原名", all_t)
-                new = st.text_input("新名")
-                if st.button("更名"):
-                    df.loc[df['teacher']==old, 'teacher'] = new
-                    st.success("已更名，請重新操作")
-                    st.rerun()
+        tab1, tab2, tab3 = st.tabs(["📅 課表檢視", "🚑 代課尋找 (單向)", "🔄 調課互換 (雙向)"])
 
-    # 主畫面
-    if not df.empty:
-        # 準備資料
-        cached_t = sorted(df['teacher'].unique())
-        all_cls = set()
-        for s in t_map.values(): all_cls.update(s)
-        try: cached_c = sorted(list(all_cls), key=lambda x: (x[0], x[1], x[2:])) 
-        except: cached_c = sorted(list(all_cls))
+        with tab1:
+            st.subheader("個別教師課表")
+            t_select = st.selectbox("選擇教師", cached_teacher_list, key="t_sel_v65")
+            if t_select:
+                t_df = df[df['teacher'] == t_select]
+                pivot_df = t_df.pivot(index='period', columns='day', values='content')
+                pivot_df = pivot_df.reindex([str(i) for i in range(1, 9)])
+                pivot_df = pivot_df.reindex(columns=["一", "二", "三", "四", "五"])
+                st.dataframe(pivot_df, use_container_width=True)
 
-        t1, t2, t3 = st.tabs(["課表檢視", "尋找代課", "調課互換"])
-
-        with t1:
-            me = st.selectbox("選擇教師", cached_t)
-            sub_df = df[df['teacher']==me].drop_duplicates(['day','period'])
-            pivot = sub_df.pivot(index='period', columns='day', values='content').reindex([str(i) for i in range(1,9)]).reindex(columns=["一","二","三","四","五"])
-            st.dataframe(pivot, use_container_width=True)
-
-        with t2:
+        with tab2:
+            st.subheader("尋找代課 (單向代課)")
             c1, c2, c3 = st.columns(3)
-            qd = c1.selectbox("星期", ["一","二","三","四","五"])
-            qp = c2.selectbox("節次", [str(i) for i in range(1,9)])
-            qs = c3.selectbox("科別", ["全部"] + sorted(list(set(df['subject'].dropna()))))
-            res = df[(df['day']==qd) & (df['period']==qp) & (df['is_free']==True)]
-            if qs != "全部": res = res[res['subject']==qs]
-            if not res.empty: st.dataframe(res[['teacher','subject']], hide_index=True, use_container_width=True)
-            else: st.warning("無空堂")
+            q_day = c1.selectbox("星期", ["一", "二", "三", "四", "五"], key="q_d_v65")
+            q_period = c2.selectbox("節次", [str(i) for i in range(1, 9)], key="q_p_v65")
+            q_subject = c3.selectbox("科別篩選", ["全部"] + sorted(list(set(df['subject'].dropna()))), key="q_s_v65")
 
-        with t3:
-            c1, c2, c3 = st.columns([2,1,1])
-            who_a = c1.selectbox("A (發起)", cached_t)
-            day_a = c2.selectbox("A 星期", ["一","二","三","四","五"])
-            per_a = c3.selectbox("A 節次", [str(i) for i in range(1,9)])
-
-            st.markdown("👇 **篩選 B 老師 (對方)**")
-            f1, f2, f3, f4 = st.columns(4)
-            ft = f1.selectbox("指定教師", ["不指定"]+cached_t)
-            fd = f2.selectbox("指定星期", ["不指定","一","二","三","四","五"])
-            fp = f3.selectbox("指定節次", ["不指定"]+[str(i) for i in range(1,9)])
-            fc = f4.selectbox("指定班級", ["不指定"]+cached_c)
-
-            # A 的詳情
-            a_row = df[(df['teacher']==who_a) & (df['day']==day_a) & (df['period']==per_a)]
-            src = {'day':day_a, 'period':per_a, 'class':'', 'course':''}
-            tgt_cls = None
-            if not a_row.empty and not a_row.iloc[0]['is_free']:
-                cnt = a_row.iloc[0]['content']
-                cls, crs = extract_class_and_course(cnt)
-                tgt_cls = cls
-                src['class'] = cls; src['course'] = crs
-                st.info(f"調出: {cls} {crs}")
+            mask = (df['day'] == q_day) & (df['period'] == q_period)
+            frees = df[mask & (df['is_free'] == True)]
+            if q_subject != "全部": frees = frees[frees['subject'] == q_subject]
+            
+            if not frees.empty:
+                st.success(f"推薦名單 ({len(frees)}人)")
+                st.dataframe(frees[['teacher', 'subject']], hide_index=True, use_container_width=True)
             else:
-                st.warning("⚠️ 選擇的是空堂")
+                st.warning("無空堂教師")
 
-            if st.button("🔍 搜尋方案"):
-                # 邏輯: 找 B 在 [day_a, per_a] 是空堂的人
-                # 且 B 在 [目標時間] 是有課的 (這樣才能換)
-                
-                # 1. 先找誰在 A 的時間是空堂
-                cands = df[(df['day']==day_a) & (df['period']==per_a) & (df['is_free']==True) & (df['teacher']!=who_a)]
-                if ft != "不指定": cands = cands[cands['teacher']==ft]
-                
-                # 2. A 老師自己的空堂時間 (用來接收 B 的課)
-                a_frees = set(df[(df['teacher']==who_a) & (df['is_free']==True)]['day'] + df[(df['teacher']==who_a) & (df['is_free']==True)]['period'])
-                
-                res = []
-                for b in cands['teacher'].unique():
-                    # 找 B 所有的忙碌時間 (潛在交換目標)
-                    b_busy = df[(df['teacher']==b) & (df['is_free']==False)]
-                    for _, r in b_busy.iterrows():
-                        # 篩選條件
-                        if fd != "不指定" and r['day'] != fd: continue
-                        if fp != "不指定" and r['period'] != fp: continue
-                        
-                        b_cls, b_crs = extract_class_and_course(r['content'])
-                        if fc != "不指定" and b_cls != fc: continue
-                        
-                        # 關鍵: 這個時間 A 必須有空
-                        if (r['day'] + r['period']) in a_frees:
-                            tag = "⭐同班" if (tgt_cls and b_cls and tgt_cls==b_cls) else ""
-                            res.append({"標記":tag, "教師姓名":b, "科目":r['subject'], "還課星期":r['day'], "還課節次":r['period'], "還課班級":b_cls, "還課課程":b_crs, "_s": 0 if tag else 1})
-                
-                if res:
-                    st.session_state.swap_res = pd.DataFrame(res).sort_values(['_s','還課星期','還課節次']).drop(columns=['_s'])
+        with tab3:
+            st.subheader("調課互換計算機 (A ⇄ B)")
+            
+            # 第一行：A 老師條件
+            col_a, col_d, col_p = st.columns([2, 1, 1])
+            initiator = col_a.selectbox("誰要調課 (A老師)?", cached_teacher_list, key="swap_who_v65")
+            swap_day = col_d.selectbox("A 想調開的星期", ["一", "二", "三", "四", "五"], key="swap_day_v65")
+            swap_period = col_p.selectbox("A 想調開的節次", [str(i) for i in range(1, 9)], key="swap_per_v65")
+
+            # 第二行：篩選條件 (v6.5 新增)
+            st.markdown("👇 **進階篩選條件 (設定您希望對方還課的時段/對象)**")
+            cf1, cf2, cf3, cf4 = st.columns(4)
+            filter_teacher = cf1.selectbox("還課教師 (指定B)", ["不指定"] + cached_teacher_list, key="fil_t_v65")
+            filter_day = cf2.selectbox("還課星期", ["不指定", "一", "二", "三", "四", "五"], key="fil_d_v65")
+            filter_period = cf3.selectbox("還課節次", ["不指定"] + [str(i) for i in range(1, 9)], key="fil_p_v65")
+            filter_class = cf4.selectbox("還課班級", ["不指定"] + cached_class_list, key="fil_c_v65")
+
+            # 顯示 A 狀態
+            a_status = df[(df['teacher'] == initiator) & (df['day'] == swap_day) & (df['period'] == swap_period)]
+            source_details = {'day': swap_day, 'period': swap_period, 'class': '無', 'course': '空堂'}
+            target_class_code = None
+
+            if not a_status.empty:
+                content_now = a_status.iloc[0]['content']
+                if content_now:
+                    cls, crs = extract_class_and_course(content_now)
+                    target_class_code = cls
+                    source_details['class'] = cls if cls else "(未識別班級)"
+                    source_details['course'] = crs if crs else content_now
+                    st.info(f"目標調出：{initiator} - {source_details['class']} {source_details['course']} (星期{swap_day} 第{swap_period}節)")
                 else:
-                    st.session_state.swap_res = pd.DataFrame()
+                    st.warning("注意：您選擇的時段目前顯示為空堂。")
+            
+            st.divider()
+            
+            if 'swap_results_v65' not in st.session_state:
+                st.session_state.swap_results_v65 = None
 
-            if 'swap_res' in st.session_state and not st.session_state.swap_res.empty:
-                st.success(f"找到 {len(st.session_state.swap_res)} 個方案")
-                ev = st.dataframe(st.session_state.swap_res, hide_index=True, use_container_width=True, selection_mode="single-row", on_select="rerun")
-                if len(ev.selection.rows) > 0:
-                    r = st.session_state.swap_res.iloc[ev.selection.rows[0]]
-                    tgt = {'day':r['還課星期'], 'period':r['還課節次'], 'class':r['還課班級'], 'course':r['還課課程']}
-                    show_popup(r['教師姓名'], df, who_a, src, tgt)
+            if st.button("🔍 搜尋雙向互換方案", key="btn_swap_v65"):
+                # 1. 先找誰在目標時段是空堂 (Candidates B)
+                candidates_b_df = df[(df['day'] == swap_day) & (df['period'] == swap_period) & (df['is_free'] == True) & (df['teacher'] != initiator)]
+                
+                # [篩選] 如果有指定還課教師，直接過濾 Candidates
+                if filter_teacher != "不指定":
+                    candidates_b_df = candidates_b_df[candidates_b_df['teacher'] == filter_teacher]
+
+                # 2. 準備 A 的所有空堂清單
+                a_free_keys = set(df[(df['teacher'] == initiator) & (df['is_free'] == True)]['day'] + "_" + df[(df['teacher'] == initiator) & (df['is_free'] == True)]['period'])
+
+                swap_options = []
+                for b_name in candidates_b_df['teacher'].unique():
+                    b_subset = df[df['teacher'] == b_name]
+                    b_subj = b_subset.iloc[0]['subject']
+                    
+                    # 遍歷 B 有課的時段 (潛在還課時段)
+                    for _, row in b_subset[b_subset['is_free'] == False].iterrows():
+                        
+                        # [篩選] 檢查還課星期
+                        if filter_day != "不指定" and row['day'] != filter_day: continue
+                        # [篩選] 檢查還課節次
+                        if filter_period != "不指定" and row['period'] != filter_period: continue
+                        
+                        # 檢查：這個時段 A 是否有空？ (雙向互換核心條件)
+                        if (row['day'] + "_" + row['period']) in a_free_keys:
+                            b_class, b_course = extract_class_and_course(row['content'])
+                            
+                            # [篩選] 檢查還課班級
+                            if filter_class != "不指定" and b_class != filter_class: continue
+
+                            # 標記同班互調
+                            tag = "⭐同班互調" if (target_class_code and b_class and target_class_code == b_class) else ""
+                            
+                            swap_options.append({
+                                "標記": tag, "教師姓名": b_name, "科目": b_subj,
+                                "還課星期": row['day'], "還課節次": row['period'],
+                                "還課班級": b_class, "還課課程": b_course,
+                                "_sort_idx": 0 if tag else 1
+                            })
+
+                if swap_options:
+                    res_df = pd.DataFrame(swap_options).sort_values(by=['_sort_idx', '還課星期', '還課節次']).drop(columns=['_sort_idx'])
+                    st.session_state.swap_results_v65 = res_df
+                else:
+                    st.session_state.swap_results_v65 = pd.DataFrame()
+
+            if st.session_state.swap_results_v65 is not None and not st.session_state.swap_results_v65.empty:
+                st.success(f"找到 {len(st.session_state.swap_results_v65)} 個互換方案！請點擊查看 👇")
+                
+                dynamic_key = f"swap_table_v65_{st.session_state.table_reset_key}"
+                
+                event = st.dataframe(
+                    st.session_state.swap_results_v65, 
+                    hide_index=True, 
+                    use_container_width=True,
+                    selection_mode="single-row",
+                    on_select="rerun",
+                    key=dynamic_key
+                )
+                
+                if len(event.selection.rows) > 0:
+                    row_data = st.session_state.swap_results_v65.iloc[event.selection.rows[0]]
+                    target_details = {'day': row_data['還課星期'], 'period': row_data['還課節次'], 'class': row_data['還課班級'], 'course': row_data['還課課程']}
+                    show_schedule_popup(row_data['教師姓名'], df, initiator, source_details, target_details)
+            elif st.session_state.swap_results_v65 is not None and st.session_state.swap_results_v65.empty:
+                if st.session_state.get('btn_swap_v65'):
+                    st.warning("無符合條件的互換人選。")
 
 if __name__ == "__main__":
     main()
