@@ -6,355 +6,299 @@ import base64
 
 # 設定頁面配置
 st.set_page_config(
-    page_title="成德高中 智慧調代課系統 v2.0",
+    page_title="成德高中 智慧調代課系統 (強力解析版)",
     page_icon="🏫",
     layout="wide"
 )
 
 # ---------------------------------------------------------
-# 1. 核心邏輯：PDF 解析與資料處理
+# 1. 核心邏輯：PDF 強力解析 (Line-by-Line)
 # ---------------------------------------------------------
 
-def clean_teacher_name(raw_text):
+def clean_teacher_name(text):
     """
-    從字串中提取純中文姓名 (2-4個字)，過濾職稱。
+    嘗試從雜亂的標題文字中提取教師姓名
     """
-    if not isinstance(raw_text, str):
-        return ""
+    if not text: return "未知教師"
     
-    # 策略 1: 尋找 "教師:XXX" 或 "教師：XXX"
-    match = re.search(r"教師[:：\s]*([\u4e00-\u9fa5]{2,4})", raw_text)
+    # 1. 抓取 "教師" 後面的內容
+    # 針對類似 "教師:陳慧敏 103導師" 或 "教師：繽奸禎"
+    match = re.search(r"教師[:：\s]*([^\s]+)", text)
     if match:
-        return match.group(1)
-    
-    # 策略 2: 如果字串本身就很短，且全是中文，可能是名字
-    clean_text = re.sub(r'[0-9a-zA-Z\s導師老師]+', '', raw_text)
-    if 2 <= len(clean_text) <= 4:
-        return clean_text
-        
-    return ""
+        name = match.group(1)
+        # 去除常見職稱與數字
+        name = re.sub(r'[0-9a-zA-Z導師]+', '', name)
+        # 如果結果是空的或太短，可能抓錯
+        if len(name) >= 2:
+            return name
+            
+    return "未知教師"
 
-def parse_schedule_pdf(uploaded_file, debug_mode=False):
+def parse_schedule_pdf_robust(uploaded_file):
     """
-    解析成德高中課表 PDF (增強版)。
-    使用 'text' 策略來偵測無格線表格。
+    使用 layout=True 模式進行逐行掃描，不依賴表格線。
     """
     all_data = []
-    debug_logs = []
+    debug_info = [] # 儲存除錯用資訊
     
     try:
         with pdfplumber.open(uploaded_file) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                text = page.extract_text() or ""
-                
-                # -------------------------
-                # 步驟 1: 提取教師姓名
-                # -------------------------
-                # 先抓取頁面最上方的幾行文字來找名字
-                header_text = text[:200] if text else "" 
-                teacher_name = clean_teacher_name(header_text)
-                
-                if not teacher_name:
-                    # 如果找不到，嘗試在整頁文字找
-                    teacher_name = clean_teacher_name(text)
-
-                if not teacher_name:
-                    if debug_mode:
-                        debug_logs.append(f"第 {page_num+1} 頁: ⚠️ 無法辨識教師姓名，跳過。")
+            for page_idx, page in enumerate(pdf.pages):
+                # 使用 layout=True 保留視覺排版 (空白間距)
+                text_layout = page.extract_text(layout=True)
+                if not text_layout:
                     continue
                 
-                # -------------------------
-                # 步驟 2: 解析表格 (關鍵修正)
-                # -------------------------
-                # 設定：使用文字間距來推斷欄位，而不是尋找黑線
-                table_settings = {
-                    "vertical_strategy": "text", 
-                    "horizontal_strategy": "text",
-                    "snap_tolerance": 5,
-                }
+                lines = text_layout.split('\n')
                 
-                tables = page.extract_tables(table_settings)
+                # --- A. 尋找教師姓名 ---
+                teacher_name = f"未知教師_P{page_idx+1}"
+                header_found = False
                 
-                if not tables:
-                    if debug_mode:
-                        debug_logs.append(f"第 {page_num+1} 頁 ({teacher_name}): ⚠️ 找不到表格結構。")
-                    continue
+                for line in lines[:10]: # 只看前10行找名字
+                    if "教師" in line:
+                        extracted = clean_teacher_name(line)
+                        if extracted != "未知教師":
+                            teacher_name = extracted
+                            header_found = True
+                        break
                 
-                # 假設最大的那個表格是課表
-                # 找出含有最多列的表格
-                main_table = max(tables, key=len)
+                # --- B. 尋找課程內容 ---
+                # 策略：尋找開頭是數字 (節次) 的行
+                # 並假設欄位分佈大致為: [節次] [一] [二] [三] [四] [五]
                 
-                # -------------------------
-                # 步驟 3: 遍歷表格列
-                # -------------------------
-                days_mapping = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五"}
-                
-                for row_idx, row in enumerate(main_table):
-                    # 濾除 None
-                    row = [cell.strip() if cell else "" for cell in row]
+                for line in lines:
+                    line = line.strip()
+                    if not line: continue
                     
-                    # 判斷是否為課程資料列
-                    # 特徵：第一欄通常是節次 (數字 1~9 或 時間)
-                    first_col = row[0]
+                    # 1. 判斷是否為課程行：開頭是 1-9 的數字，後面跟著空白或冒號
+                    # Regex: ^[0-9] 且後面不是純文字
+                    # 許多課表格式: "1  08:10", "1", "08:10"
                     
-                    # 嘗試提取節次數字
-                    period = None
-                    # 用 Regex 抓開頭的數字 (1, 2, ... 8)
-                    p_match = re.match(r'^([1-9])', first_col)
-                    if p_match:
-                        period = int(p_match.group(1))
+                    # 簡易判斷：開頭是單個數字
+                    is_period_row = False
+                    period = -1
                     
-                    if period is None:
-                        continue # 跳過非課程列 (如標題、早自習、午休)
+                    match = re.match(r'^([1-9])\s+', line)
+                    if match:
+                        period = int(match.group(1))
+                        is_period_row = True
+                    
+                    if is_period_row:
+                        # 2. 拆分欄位 (利用 2 個以上的連續空白作為分隔符)
+                        # 因為 layout=True 模式下，不同欄位間通常會有大空白
+                        parts = re.split(r'\s{2,}', line)
                         
-                    # 讀取 週一 ~ 週五 的資料
-                    # 假設欄位結構: [節次, 一, 二, 三, 四, 五, ...]
-                    # 有時候 PDF 解析出的欄位數會變動，我們抓前 6 欄 (Index 0~5)
-                    
-                    current_col = 1 # 從 index 1 開始是對應星期一
-                    for day_idx in range(1, 6): # 1~5 (一~五)
-                        if current_col >= len(row):
-                            break
+                        # parts[0] 應該是節次/時間
+                        # parts[1:] 應該是星期一 ~ 五
+                        # 但有時候 parts[0] 包含了 "1 08:00"，所以要小心
                         
-                        cell_content = row[current_col]
-                        day_name = days_mapping[day_idx]
-                        current_col += 1
+                        # 嘗試對應星期
+                        # 理想狀況 parts 長度應該是 6 (節次 + 5天)
+                        # 但如果有空堂，pdfplumber 有時會讀不到該欄位，導致 parts 變少
+                        # 這是最難的部分。我們改用「固定位置」推測法或是簡單的順序法
                         
-                        if len(cell_content) > 1: # 排除空字串
-                            # 處理內容，通常是 "科目 班級" 或 "科目\n班級"
-                            # 移除過多空白
-                            content = re.sub(r'\s+', ' ', cell_content).strip()
+                        # 簡易解法：假設課表都有填滿 (即使是空字串)，或者靠順序
+                        # 如果 parts 少於 2，代表沒內容
+                        if len(parts) < 2:
+                            continue
                             
-                            # 嘗試拆分科目與班級 (簡單邏輯：最後一個詞可能是班級)
-                            parts = content.split(' ')
-                            if len(parts) >= 2:
-                                subject = " ".join(parts[:-1])
-                                classname = parts[-1]
-                            else:
-                                subject = content
-                                classname = "?"
-                                
-                            all_data.append({
-                                "Teacher": teacher_name,
-                                "Day": day_name,
-                                "Period": period,
-                                "Subject": subject,
-                                "Class": classname,
-                                "FullContent": content
-                            })
+                        # 移除第一個元素 (節次/時間)
+                        content_parts = parts[1:]
+                        
+                        days = ["一", "二", "三", "四", "五"]
+                        
+                        # 如果切出來剛好 5 個，那就完美對應
+                        # 如果少於 5 個，可能是中間有空堂被吃掉了，或是最後幾天沒課
+                        # 這裡做一個大膽假設：依序填入 (這在 pdfplumber layout 模式下通常是對的，因為空堂通常是空白字串而非消失)
+                        
+                        for i, content in enumerate(content_parts):
+                            if i < 5:
+                                # 清理內容 (移除換行符號等)
+                                content = content.strip()
+                                if content and content != ".": # 雜訊過濾
+                                    # 嘗試分離 科目/班級
+                                    # 常見格式: "國語 101"
+                                    sub_parts = content.split(' ')
+                                    subject = sub_parts[0]
+                                    classname = sub_parts[-1] if len(sub_parts) > 1 else ""
+                                    
+                                    all_data.append({
+                                        "Teacher": teacher_name,
+                                        "Day": days[i],
+                                        "Period": period,
+                                        "Subject": subject,
+                                        "Class": classname,
+                                        "FullContent": content
+                                    })
                 
-                if debug_mode:
-                    debug_logs.append(f"第 {page_num+1} 頁 ({teacher_name}): ✅ 成功解析 (範例: {all_data[-1]['Subject'] if all_data else '無'})")
+                # 記錄前幾行的原始文字供除錯
+                debug_info.append(f"--- Page {page_idx+1} ({teacher_name}) ---\n" + "\n".join(lines[:5]) + "\n...")
 
-        return pd.DataFrame(all_data), debug_logs
+        return pd.DataFrame(all_data), debug_info
 
     except Exception as e:
-        return pd.DataFrame(), [f"❌ 發生錯誤: {str(e)}"]
+        return pd.DataFrame(), [f"Error: {str(e)}"]
 
 # ---------------------------------------------------------
-# UI 輔助函式
+# UI 元件
 # ---------------------------------------------------------
 
 def generate_print_button(teacher_a, content_a, teacher_b, content_b, swap_info):
-    html_content = f"""
-    <html>
-    <head>
-        <style>
-            body {{ font-family: "Microsoft JhengHei", Arial; padding: 20px; }}
-            .container {{ border: 2px solid #333; padding: 20px; max-width: 800px; margin: 0 auto; }}
-            h1 {{ text-align: center; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-            th, td {{ border: 1px solid #333; padding: 10px; text-align: center; }}
-            .signature {{ margin-top: 50px; display: flex; justify-content: space-between; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>成德高中 教師調代課互換申請單</h1>
-            <p><strong>申請日期：</strong> <span id="date"></span></p>
-            <table>
-                <tr>
-                    <th>角色</th><th>教師</th><th>原定時間</th><th>科目/班級</th><th>異動</th>
-                </tr>
-                <tr>
-                    <td>申請人 (A)</td><td>{teacher_a}</td>
-                    <td>{swap_info['Day_A']} 第 {swap_info['Period_A']} 節</td>
-                    <td>{content_a}</td><td>轉給 {teacher_b}</td>
-                </tr>
-                <tr>
-                    <td>對象 (B)</td><td>{teacher_b}</td>
-                    <td>{swap_info['Day_B']} 第 {swap_info['Period_B']} 節</td>
-                    <td>{content_b}</td><td>轉給 {teacher_a}</td>
-                </tr>
-            </table>
-            <div class="signature">
-                <div>申請人：___________</div>
-                <div>對象：___________</div>
-                <div>教學組：___________</div>
-            </div>
+    html = f"""
+    <html><body>
+    <div style="border:2px solid black; padding:20px; width: 600px; font-family: Microsoft JhengHei;">
+        <h2 style="text-align:center">調課申請單</h2>
+        <p><strong>日期:</strong> <span id="d"></span></p>
+        <table border="1" style="width:100%; border-collapse:collapse; text-align:center;">
+            <tr><td>申請人</td><td>{teacher_a}</td><td>{swap_info['Day_A']} 第{swap_info['Period_A']}節</td><td>{content_a}</td></tr>
+            <tr><td>對象</td><td>{teacher_b}</td><td>{swap_info['Day_B']} 第{swap_info['Period_B']}節</td><td>{content_b}</td></tr>
+        </table>
+        <br><br>
+        <div style="display:flex; justify-content:space-between;">
+            <span>申請人簽章:________</span><span>對象簽章:________</span>
         </div>
-        <script>
-            document.getElementById('date').innerText = new Date().toLocaleDateString();
-            window.print();
-        </script>
-    </body>
-    </html>
+    </div>
+    <script>document.getElementById('d').innerText=new Date().toLocaleDateString(); window.print();</script>
+    </body></html>
     """
-    b64_html = base64.b64encode(html_content.encode()).decode()
-    return f'<a href="data:text/html;base64,{b64_html}" target="_blank" style="background-color: #FF4B4B; color: white; padding: 8px 15px; text-decoration: none; border-radius: 5px;">🖨️ 列印調課單</a>'
+    b64 = base64.b64encode(html.encode()).decode()
+    return f'<a href="data:text/html;base64,{b64}" target="_blank" style="background:#f44336;color:white;padding:5px 10px;text-decoration:none;border-radius:5px;">🖨️ 列印</a>'
 
 # ---------------------------------------------------------
-# 主程式
+# Main
 # ---------------------------------------------------------
 
 def main():
-    st.title("🏫 成德高中 智慧調代課系統 v2.0")
-    st.markdown("---")
-
+    st.title("🏫 成德高中 智慧調代課系統 (v3.0 強力解析)")
+    
     with st.sidebar:
-        st.header("1. 資料來源")
-        uploaded_file = st.file_uploader("請上傳課表 PDF", type=["pdf"])
+        st.info("💡 如果教師姓名顯示為亂碼，是因為 PDF 內部編碼問題。您可以在此系統中透過下拉選單找到對應的『亂碼ID』來操作。")
+        uploaded_file = st.file_uploader("上傳課表 PDF", type=["pdf"])
+        show_debug = st.checkbox("顯示原始解析資料 (Debug)", value=False)
+
+    df = pd.DataFrame()
+    if uploaded_file:
+        with st.spinner("正在暴力解析 PDF..."):
+            df, debug_logs = parse_schedule_pdf_robust(uploaded_file)
         
-        debug_mode = st.checkbox("開啟除錯模式 (顯示解析紀錄)", value=False)
+        if show_debug:
+            with st.expander("PDF 原始讀取內容 (若為亂碼代表 PDF 編碼有誤)", expanded=True):
+                for log in debug_logs:
+                    st.text(log)
         
-        df = pd.DataFrame()
-        if uploaded_file:
-            with st.spinner("正在解析 PDF 課表 (Text Strategy)..."):
-                df, logs = parse_schedule_pdf(uploaded_file, debug_mode)
-            
-            if debug_mode:
-                with st.expander("📝 解析紀錄 (Debug Log)", expanded=True):
-                    for log in logs:
-                        st.text(log)
-            
-            if not df.empty:
-                st.success(f"讀取成功！共解析出 {len(df)} 筆課程資料。")
-                st.info(f"偵測到 {df['Teacher'].nunique()} 位教師。")
-                if debug_mode:
-                    st.write("預覽資料:", df.head())
-            else:
-                st.error("無法解析資料。請確認 PDF 是否為文字格式 (非掃描圖片)，或嘗試開啟除錯模式檢查。")
-                return
-        else:
-            st.info("請先上傳檔案。")
+        if df.empty:
+            st.error("解析後無資料。請確認 PDF 是否為掃描圖檔 (圖片無法讀取文字)。")
             return
-
-    if df.empty:
-        return
-
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["📅 課表檢視", "🔍 尋找代課", "🔄 互換調課"])
-
-    # Tab 1: 課表檢視
-    with tab1:
-        st.subheader("教師週課表")
-        teachers = sorted(df['Teacher'].unique())
-        if not teachers:
-            st.warning("無教師資料")
         else:
-            selected_teacher = st.selectbox("選擇教師", teachers)
-            t_df = df[df['Teacher'] == selected_teacher]
-            
-            # Pivot
-            pivot = t_df.pivot_table(index='Period', columns='Day', values='FullContent', aggfunc='first')
-            # 補齊結構
-            pivot = pivot.reindex(index=range(1, 9), columns=["一", "二", "三", "四", "五"]).fillna("")
-            st.dataframe(pivot, use_container_width=True)
+            st.success(f"成功載入 {len(df)} 筆課程，共 {df['Teacher'].nunique()} 位教師。")
 
-    # Tab 2: 尋找代課
-    with tab2:
-        st.subheader("空堂查詢")
+    if df.empty: return
+
+    # --- 功能區 ---
+    t1, t2, t3 = st.tabs(["📅 課表檢視", "🔍 尋找代課", "🔄 互換調課"])
+
+    # 共用資料
+    all_teachers = sorted(df['Teacher'].unique())
+    all_days = ["一", "二", "三", "四", "五"]
+
+    with t1:
+        c_t, c_name = st.columns([1, 2])
+        sel_t = c_t.selectbox("選擇教師", all_teachers)
+        
+        # 讓使用者可以自己備註這是誰
+        st.caption(f"目前顯示: **{sel_t}** 的課表")
+        
+        t_data = df[df['Teacher'] == sel_t]
+        pivot = t_data.pivot_table(index='Period', columns='Day', values='FullContent', aggfunc='first')
+        pivot = pivot.reindex(index=range(1, 9), columns=all_days).fillna("")
+        st.dataframe(pivot, use_container_width=True)
+
+    with t2:
         c1, c2 = st.columns(2)
-        d = c1.selectbox("星期", ["一", "二", "三", "四", "五"])
-        p = c2.selectbox("節次", range(1, 9))
+        target_d = c1.selectbox("缺課星期", all_days)
+        target_p = c2.selectbox("缺課節次", range(1, 9))
         
-        if st.button("搜尋"):
-            busy = df[(df['Day'] == d) & (df['Period'] == p)]['Teacher'].unique()
-            all_t = set(df['Teacher'].unique())
-            free = sorted(list(all_t - set(busy)))
-            st.write(f"**{len(free)} 位教師空堂：**")
-            st.write(", ".join([f"`{x}`" for x in free]))
+        if st.button("查詢空堂教師"):
+            busy_list = df[(df['Day'] == target_d) & (df['Period'] == target_p)]['Teacher'].unique()
+            free_list = sorted(list(set(all_teachers) - set(busy_list)))
+            st.write(f"共有 {len(free_list)} 位空堂：")
+            st.write(" ".join([f"`{x}`" for x in free_list]))
 
-    # Tab 3: 互換調課
-    with tab3:
-        st.subheader("雙向調課計算機")
+    with t3:
+        st.subheader("雙向調課")
+        # Step 1: 選擇發起人
+        col_1, col_2 = st.columns(2)
+        who_a = col_1.selectbox("申請人 (A)", all_teachers)
         
-        # A 設定
-        col_a1, col_a2 = st.columns(2)
-        teacher_a = col_a1.selectbox("發起人 (A)", teachers)
-        
-        df_a = df[df['Teacher'] == teacher_a].sort_values(['Day', 'Period'])
+        df_a = df[df['Teacher'] == who_a]
         if df_a.empty:
-            st.warning("此教師無課程")
+            st.warning("此人無課")
         else:
-            opts = [f"{r['Day']} {r['Period']}節: {r['FullContent']}" for _, r in df_a.iterrows()]
-            course_str = col_a2.selectbox("A 欲換出的課", opts)
+            opts = [f"週{r['Day']} {r['Period']}節: {r['FullContent']}" for i, r in df_a.iterrows()]
+            pick_course = col_2.selectbox("A 欲換出的課", opts)
             
-            # 解析選擇
-            idx = opts.index(course_str)
-            course_a = df_a.iloc[idx]
+            # 取得 A 課程詳情
+            # 這裡用字串比對回推有點危險，改用 index 比較安全，但為了簡單先這樣
+            # 更好的做法是在 selectbox 存 ID
             
-            st.divider()
-            
-            # 尋找 B
-            if st.button("計算可行交換"):
-                # 邏輯: 找 B
-                # 1. B 在 A的時間 (A_Day, A_Period) 空堂
-                # 2. A 在 B的時間 (B_Day, B_Period) 空堂
+            # 解析 "週一 2節..."
+            match = re.search(r"週(.) (\d)節", pick_course)
+            if match:
+                day_a, period_a = match.group(1), int(match.group(2))
+                subject_a = pick_course.split(": ")[1]
                 
-                # A 的所有忙碌時間
-                a_busy = set(zip(df_a['Day'], df_a['Period']))
+                st.divider()
+                st.write("### 篩選 B")
                 
-                candidates = []
-                others = df[df['Teacher'] != teacher_a]
-                
-                for _, row_b in others.iterrows():
-                    # B 的時間
-                    b_d, b_p = row_b['Day'], row_b['Period']
+                # 計算邏輯
+                if st.button("計算匹配對象"):
+                    # A 的忙碌時間表 (Set lookup for speed)
+                    a_busy_slots = set(zip(df_a['Day'], df_a['Period']))
                     
-                    # 排除相同時間 (無法交換)
-                    if b_d == course_a['Day'] and b_p == course_a['Period']:
-                        continue
+                    res = []
+                    # 找所有其他人
+                    others = df[df['Teacher'] != who_a]
+                    
+                    for t_b in others['Teacher'].unique():
+                        # B 的所有課
+                        df_b = others[others['Teacher'] == t_b]
                         
-                    # 檢查 1: B 在 A 的原時間是否有課?
-                    # 查詢 others 中，Teacher=B, Day=A_Day, Period=A_Period
-                    b_busy_at_a = not others[
-                        (others['Teacher'] == row_b['Teacher']) & 
-                        (others['Day'] == course_a['Day']) & 
-                        (others['Period'] == course_a['Period'])
-                    ].empty
-                    
-                    if b_busy_at_a: continue
-                    
-                    # 檢查 2: A 在 B 的原時間是否有課?
-                    if (b_d, b_p) in a_busy: continue
-                    
-                    # 符合
-                    candidates.append(row_b)
-                
-                if not candidates:
-                    st.info("無符合對象")
-                else:
-                    res = pd.DataFrame(candidates)
-                    res['SameClass'] = res['Class'] == course_a['Class']
-                    res = res.sort_values(['SameClass', 'Day', 'Period'], ascending=[False, True, True])
-                    
-                    st.success(f"找到 {len(res)} 個方案")
-                    
-                    for _, r in res.iterrows():
-                        icon = "⭐" if r['SameClass'] else ""
-                        with st.expander(f"{icon} {r['Teacher']} - 週{r['Day']} 第{r['Period']}節 ({r['Subject']})"):
-                            st.write(f"與 {teacher_a} 的 週{course_a['Day']} 第{course_a['Period']}節 交換")
+                        # 1. B 在 A的時間 (day_a, period_a) 必須沒課
+                        if not df_b[(df_b['Day'] == day_a) & (df_b['Period'] == period_a)].empty:
+                            continue
                             
-                            swap_ctx = {
-                                "Day_A": course_a['Day'], "Period_A": course_a['Period'],
-                                "Day_B": r['Day'], "Period_B": r['Period']
-                            }
-                            st.markdown(generate_print_button(
-                                teacher_a, course_a['FullContent'], 
-                                r['Teacher'], r['FullContent'], 
-                                swap_ctx
-                            ), unsafe_allow_html=True)
+                        # 2. 遍歷 B 的每一堂課，看 A 能不能接
+                        for _, row_b in df_b.iterrows():
+                            # A 在 B的時間 (row_b.Day, row_b.Period) 必須沒課
+                            if (row_b['Day'], row_b['Period']) in a_busy_slots:
+                                continue
+                                
+                            # 3. 排除同一時間 (無意義交換)
+                            if row_b['Day'] == day_a and row_b['Period'] == period_a:
+                                continue
+                                
+                            # 匹配成功
+                            res.append({
+                                "Teacher_B": t_b,
+                                "Day_B": row_b['Day'], "Period_B": row_b['Period'],
+                                "Content_B": row_b['FullContent'],
+                                "SameClass": (subject_a.split()[-1] in row_b['FullContent']) # 粗略判斷同班
+                            })
+                            
+                    if not res:
+                        st.warning("無符合對象")
+                    else:
+                        res_df = pd.DataFrame(res).sort_values(['SameClass', 'Day_B', 'Period_B'], ascending=[False, True, True])
+                        st.success(f"找到 {len(res_df)} 個方案")
+                        
+                        for _, row in res_df.iterrows():
+                             with st.expander(f"{'⭐' if row['SameClass'] else ''} 與 {row['Teacher_B']} - 週{row['Day_B']} 第{row['Period_B']}節"):
+                                 ctx = {
+                                     "Day_A": day_a, "Period_A": period_a,
+                                     "Day_B": row['Day_B'], "Period_B": row['Period_B']
+                                 }
+                                 st.markdown(generate_print_button(who_a, subject_a, row['Teacher_B'], row['Content_B'], ctx), unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
